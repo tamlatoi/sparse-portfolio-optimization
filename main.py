@@ -1,50 +1,27 @@
 import cvxpy as cp
 import numpy as np
+import yfinance as yf
 
 
-def solve_initial_sparse_portfolio(mu, Q, lambda_param, gamma, long_only=False):
-    """Solves the initial sparse portfolio optimization problem from the image.
-
-    Parameters:
-    -----------
-    mu : ndarray
-        Expected return vector (shape: n,)
-    Q : ndarray
-        Covariance matrix of asset returns (shape: n x n)
-    lambda_param : float
-        Risk-return tradeoff parameter (lambda > 0)
-    gamma : float
-        Sparsity regularization parameter (gamma > 0)
-    long_only : bool, optional
-        If True, adds w >= 0 constraint. Defaults to False (allows shorting).
-    """
+def solve_large_sparse_portfolio(mu, Q, lambda_param, gamma):
+    """Solves the sparse portfolio optimization problem for 100+ assets."""
     n = len(mu)
-
-    # Define the optimization variable
     w = cp.Variable(n)
 
-    # Formulate the objective function exactly as shown in the image:
-    # min 0.5 * w^T * Q * w - lambda * mu^T * w + gamma * ||w||_1
+    # Core Objective: Minimize Risk + Sparsity Penalty - Expected Return
     portfolio_risk = 0.5 * cp.quad_form(w, Q)
     expected_return = lambda_param * (mu @ w)
     sparsity_penalty = gamma * cp.norm(w, 1)
 
     objective = cp.Minimize(portfolio_risk - expected_return + sparsity_penalty)
+    constraints = [cp.sum(w) == 1, w >= 0]
 
-    # Constraints: sum(w_i) = 1
-    constraints = [cp.sum(w) == 1]
-
-    # Add long-only constraint if desired (forces weights to be >= 0)
-    if long_only:
-        constraints.append(w >= 0)
-
-    # Solve the convex optimization problem
     prob = cp.Problem(objective, constraints)
-    # Try running with default settings if ECOS is missing
+
     try:
-        prob.solve()  # Let CVXPY automatically choose an available solver (like OSQP or QDLDL)
+        prob.solve(solver=cp.OSQP)
     except Exception:
-        prob.solve(solver=cp.OSQP)  # Backup solver that handles quadratic forms incredibly well
+        prob.solve()
 
     if prob.status not in ["optimal", "optimal_inaccurate"]:
         raise ValueError(f"Optimization failed with status: {prob.status}")
@@ -52,33 +29,96 @@ def solve_initial_sparse_portfolio(mu, Q, lambda_param, gamma, long_only=False):
     return w.value
 
 
-# ==========================================
-# Example Execution
-# ==========================================
 if __name__ == "__main__":
-    # Example data for 4 assets
-    mu_example = np.array([0.08, 0.12, 0.10, 0.05])
+    sp100_string = """
+    AAPL MSFT GOOGL AMZN NVDA META TSLA BRK-B LLY V
+    UNH JPM XOM WMT MA PG AVGO ORCL HD CVX
+    COST MRK BAC ABBV KO PEP AMD ADBE CRM QCOM
+    CMCSA NFLX DIS TMUS CSCO VZ INTC TXN AMGN IBM
+    HON GE CAT LMT RTX AXP GS BLK C MS
+    SCHW LOW NKE SBUX TJX TGT MCD SRE DUK SO
+    NEE LIN APD FCX COP EOG SLB JNJ PFE BMY
+    GILD MDT ISRG SYK REGN UPS FDX DE MMM EMR
+    AEP EXC WM PLTR PANW ANET DELL MU LRCX AMAT
+    T MDLZ MO PM CL EL COF BK WFC
+    """
 
-    # 4x4 positive semi-definite covariance matrix
-    Q_example = np.array(
-        [
-            [0.04, 0.01, 0.02, 0.00],
-            [0.01, 0.06, 0.01, 0.01],
-            [0.02, 0.01, 0.05, 0.02],
-            [0.00, 0.01, 0.02, 0.03],
-        ]
+    sp100_tickers = [ticker for ticker in sp100_string.split()]
+
+    print(
+        f"Successfully initialized {len(sp100_tickers)} components of the S&P 100."
+    )
+    print("Downloading 3 years of historical market data from Yahoo Finance...")
+
+    # Download raw data block
+    df_raw = yf.download(sp100_tickers, start="2023-01-01", end="2026-01-01")
+
+    # --- ARMORED COLUMN PARSING ---
+    # Safe structure detection for multi-index vs flat DataFrames
+    if df_raw.columns.ndim > 1:
+        available_fields = df_raw.columns.levels[0]
+        if "Adj Close" in available_fields:
+            raw_data = df_raw["Adj Close"]
+        elif "Close" in available_fields:
+            raw_data = df_raw["Close"]
+        else:
+            raw_data = df_raw
+    else:
+        if "Adj Close" in df_raw.columns:
+            raw_data = df_raw["Adj Close"]
+        elif "Close" in df_raw.columns:
+            raw_data = df_raw["Close"]
+        else:
+            raw_data = df_raw
+
+    # CRITICAL BULLETPROOF STEP: Drop columns that are completely empty or failed to download
+    # 'how="all"' drops columns if Yahoo returned absolutely zero data for them
+    raw_data = raw_data.dropna(axis=1, how="all")
+
+    # Drop remaining rows that have partial missing entries
+    cleaned_data = raw_data.dropna(axis=1, how="any")
+    active_tickers = list(cleaned_data.columns)
+
+    print(
+        f"Data preparation complete. Optimizing across {len(active_tickers)} successfully fetched stocks."
     )
 
-    # Parameters
-    lambda_val = 0.5  # Risk-return tradeoff
-    gamma_val = 0.05  # Sparsity penalty
+    # Re-calculate daily return structures dynamically matching the active dimensions
+    daily_returns = cleaned_data.pct_change().dropna()
 
-    # Run optimization (allowing short positions as per the image's basic constraints)
-    weights = solve_initial_sparse_portfolio(
-        mu_example, Q_example, lambda_val, gamma_val, long_only=False
-    )
+    # Calculate real annualized returns and risk matrices
+    mu_real = daily_returns.mean().values * 252
+    Q_real = daily_returns.cov().values * 252
 
-    print("--- Optimized Portfolio Weights ---")
-    for i, w_i in enumerate(weights):
-        # Round near-zero values for clean output due to L1 regularization
-        print(f"Asset {i+1}: {0.0 if np.isclose(w_i, 0, atol=1e-4) else w_i:.2%}")
+    # --- Hyperparameters ---
+    lambda_val = 0.1  # Standard risk-return trade-off
+    gamma_val = 0.5  # Gentle sparsity penalty
+
+    # Run the optimization model
+    try:
+        weights = solve_large_sparse_portfolio(
+            mu_real, Q_real, lambda_val, gamma_val
+        )
+
+        print("\n=============================================")
+        print(f"      OPTIMIZED S&P 100 PORTFOLIO WEIGHTS    ")
+        print(f"      (Regularization Penalty γ = {gamma_val})  ")
+        print("=============================================")
+
+        allocated_count = 0
+        for i, ticker in enumerate(active_tickers):
+            w_i = weights[i]
+            clean_weight = 0.0 if np.isclose(w_i, 0, atol=1e-4) else w_i
+
+            if clean_weight > 0:
+                print(f"  {ticker:<6} : {clean_weight:.2%}")
+                allocated_count += 1
+
+        print("---------------------------------------------")
+        print(
+            f"Result: Out of {len(active_tickers)} assets, the algorithm filtered down to a concentrated basket of ONLY {allocated_count} core picks."
+        )
+        print("=============================================")
+
+    except Exception as e:
+        print(f"Optimization pipeline hit an error: {e}")
