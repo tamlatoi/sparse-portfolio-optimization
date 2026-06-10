@@ -1,30 +1,39 @@
+import sys
 import cvxpy as cp
 import numpy as np
 import yfinance as yf
 
 
-def solve_large_sparse_portfolio(mu, Q, lambda_param, gamma):
-    """Solves the sparse portfolio optimization problem for 100+ assets."""
+def solve_large_sparse_portfolio(mu, Q, lambda_param, gamma, w_drift=None, tau=0.0):
+    """Solves the sparse portfolio optimization problem with a dynamic turnover penalty."""
     n = len(mu)
     w = cp.Variable(n)
 
-    # Core Objective: Minimize Risk + Sparsity Penalty - Expected Return
+    # 1. Core Objective Elements
     portfolio_risk = 0.5 * cp.quad_form(w, Q)
     expected_return = lambda_param * (mu @ w)
     sparsity_penalty = gamma * cp.norm(w, 1)
 
-    objective = cp.Minimize(portfolio_risk - expected_return + sparsity_penalty)
-    constraints = [cp.sum(w) == 1, w >= 0]
+    # 2. Dynamic Turnover Penalty (Handles trading friction relative to drifted weights)
+    if w_drift is None:
+        w_drift = np.zeros(n)
+    turnover_penalty = tau * cp.norm(w - w_drift, 1)
+
+    # Combine all elements into a unified objective
+    objective = cp.Minimize(
+        portfolio_risk - expected_return + sparsity_penalty + turnover_penalty
+    )
+    constraints = [cp.sum(w) == 1, w >= 0]  # Fully invested, long-only
 
     prob = cp.Problem(objective, constraints)
 
     try:
         prob.solve(solver=cp.OSQP)
     except Exception:
-        prob.solve()
+        prob.solve(solver=cp.ECOS)
 
     if prob.status not in ["optimal", "optimal_inaccurate"]:
-        raise ValueError(f"Optimization failed with status: {prob.status}")
+        return None  # Let backtester fall back safely rather than crashing
 
     return w.value
 
@@ -42,66 +51,49 @@ if __name__ == "__main__":
     AEP EXC WM PLTR PANW ANET DELL MU LRCX AMAT
     T MDLZ MO PM CL EL COF BK WFC
     """
-
     sp100_tickers = [ticker for ticker in sp100_string.split()]
 
-    print(
-        f"Successfully initialized {len(sp100_tickers)} components of the S&P 100."
-    )
+    print(f"Successfully initialized {len(sp100_tickers)} components of the S&P 100.")
     print("Downloading 3 years of historical market data from Yahoo Finance...")
 
-    # Download raw data block
     df_raw = yf.download(sp100_tickers, start="2023-01-01", end="2026-01-01")
 
     # --- ARMORED COLUMN PARSING ---
-    # Safe structure detection for multi-index vs flat DataFrames
     if df_raw.columns.ndim > 1:
         available_fields = df_raw.columns.levels[0]
-        if "Adj Close" in available_fields:
-            raw_data = df_raw["Adj Close"]
-        elif "Close" in available_fields:
-            raw_data = df_raw["Close"]
-        else:
-            raw_data = df_raw
+        raw_data = (
+            df_raw["Adj Close"]
+            if "Adj Close" in available_fields
+            else df_raw["Close"]
+        )
     else:
-        if "Adj Close" in df_raw.columns:
-            raw_data = df_raw["Adj Close"]
-        elif "Close" in df_raw.columns:
-            raw_data = df_raw["Close"]
-        else:
-            raw_data = df_raw
+        raw_data = (
+            df_raw["Adj Close"]
+            if "Adj Close" in df_raw.columns
+            else df_raw["Close"]
+        )
 
-    # CRITICAL BULLETPROOF STEP: Drop columns that are completely empty or failed to download
-    # 'how="all"' drops columns if Yahoo returned absolutely zero data for them
     raw_data = raw_data.dropna(axis=1, how="all")
-
-    # Drop remaining rows that have partial missing entries
     cleaned_data = raw_data.dropna(axis=1, how="any")
     active_tickers = list(cleaned_data.columns)
 
-    print(
-        f"Data preparation complete. Optimizing across {len(active_tickers)} successfully fetched stocks."
-    )
+    print(f"Data prep complete. Optimizing across {len(active_tickers)} stocks.")
 
-    # Re-calculate daily return structures dynamically matching the active dimensions
     daily_returns = cleaned_data.pct_change().dropna()
-
-    # Calculate real annualized returns and risk matrices
     mu_real = daily_returns.mean().values * 252
     Q_real = daily_returns.cov().values * 252
 
-    # --- Hyperparameters ---
-    lambda_val = 0.1  # Standard risk-return trade-off
-    gamma_val = 0.5  # Gentle sparsity penalty
+    # Standalone execution uses base hyperparameters (no drift constraint on Day 0)
+    lambda_val = 0.1
+    gamma_val = 0.5
 
-    # Run the optimization model
     try:
         weights = solve_large_sparse_portfolio(
             mu_real, Q_real, lambda_val, gamma_val
         )
 
         print("\n=============================================")
-        print(f"      OPTIMIZED S&P 100 PORTFOLIO WEIGHTS    ")
+        print(f"       STATIC PORTFOLIO WEIGHT ALLOCATIONS    ")
         print(f"      (Regularization Penalty γ = {gamma_val})  ")
         print("=============================================")
 
@@ -115,9 +107,7 @@ if __name__ == "__main__":
                 allocated_count += 1
 
         print("---------------------------------------------")
-        print(
-            f"Result: Out of {len(active_tickers)} assets, the algorithm filtered down to a concentrated basket of ONLY {allocated_count} core picks."
-        )
+        print(f"Result: Concentrated basket of ONLY {allocated_count} core picks.")
         print("=============================================")
 
     except Exception as e:
