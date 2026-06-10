@@ -1,10 +1,9 @@
-# backtest.py
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# Import your core optimization engine cleanly from main.py
+# Import my core optimization engine cleanly from main.py
 from main import solve_large_sparse_portfolio
 
 
