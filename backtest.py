@@ -221,7 +221,18 @@ def plot_comparative_results(results_df):
     plt.show()
 
 if __name__ == "__main__":
-    sp100_string = "AAPL MSFT GOOGL AMZN NVDA META TSLA BRK-B LLY V UNH JPM XOM WMT MA PG GE GILD PLTR T"
+    sp100_string = """
+    AAPL MSFT GOOGL AMZN NVDA META TSLA BRK-B LLY V
+    UNH JPM XOM WMT MA PG AVGO ORCL HD CVX
+    COST MRK BAC ABBV KO PEP AMD ADBE CRM QCOM
+    CMCSA NFLX DIS TMUS CSCO VZ INTC TXN AMGN IBM
+    HON GE CAT LMT RTX AXP GS BLK C MS
+    SCHW LOW NKE SBUX TJX TGT MCD SRE DUK SO
+    NEE LIN APD FCX COP EOG SLB JNJ PFE BMY
+    GILD MDT ISRG SYK REGN UPS FDX DE MMM EMR
+    AEP EXC WM PLTR PANW ANET DELL MU LRCX AMAT
+    T MDLZ MO PM CL EL COF BK WFC
+    """
     raw_tickers = sp100_string.split()
 
     print("Downloading global multi-asset historical returns matrix (Asset-by-Asset mode)...")
@@ -230,17 +241,24 @@ if __name__ == "__main__":
     downloaded_series = {}
     for ticker in raw_tickers:
         try:
-            # Fetching data individually keeps one young stock (like PLTR) from breaking old ones (like AAPL)
             df_single = yf.download(ticker, start="2015-01-01", end="2026-01-01", progress=False)
             
             # Extract closing price safely regardless of yfinance multi-index nesting
             if isinstance(df_single.columns, pd.MultiIndex):
                 col = "Adj Close" if "Adj Close" in df_single.columns.levels[0] else "Close"
+                # Ensure we select only the 1D series for this ticker
                 series = df_single[col][ticker]
             else:
                 col = "Adj Close" if "Adj Close" in df_single.columns else "Close"
                 series = df_single[col]
                 
+            # CRITICAL FIX: Force the series to be 1D and cleanly named
+            if isinstance(series, pd.DataFrame):
+                series = series.iloc[:, 0] # Take the first column if multiple exist
+                
+            series = series.squeeze() # Squeeze any single-dimensional wrapper shapes
+            series.name = ticker      # Explicitly tag the column name
+            
             if not series.dropna().empty:
                 downloaded_series[ticker] = series
         except Exception:
@@ -267,7 +285,7 @@ if __name__ == "__main__":
     # --- Hyperparameters ---
     lambda_val = 0.1
     gamma_val = 0.03
-    tau_val = 0.005
+    tau_val = 0.05
 
     print("Initiating twin-engine backtest loop simulation...\n")
     results = run_comprehensive_backtest(
