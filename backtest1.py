@@ -1,33 +1,26 @@
-import concurrent.futures
-import urllib.request
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
+import numpy as np
 import yfinance as yf
+import matplotlib.pyplot as plt
 
-# Pure link import from your local core optimization engine
+# Import the core optimization engine cleanly from main.py
 from main import solve_large_sparse_portfolio
 
-
-def run_comprehensive_backtest(
-    df_returns,
-    lookback_window=252,
-    rebalance_freq=21,
-    lambda_val=2.0,       
-    gamma_val=0.0,       
-    tau_val=0.005,
-):
-    """Simulates both the turnover-constrained and baseline portfolios simultaneously."""
+def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance_freq=21, lambda_val=0.4, gamma_val=0.05, tau_val=0.02):
+    """
+    Simulates portfolio strategies. 
+    Dimensions of w and w_drift are strictly bound to df_returns.shape[1]
+    """
     n_timesteps, n_assets = df_returns.shape
+    print(f"Initializing Backtest Engine. Timesteps: {n_timesteps}, Active Assets: {n_assets}")
 
-    # Data collection arrays for Strategy 1 (Turnover Constrained)
+    # Strategy 1 Data Structures (Turnover Constrained)
     strat_turnover_returns = []
     active_turnover_count = []
-    weights_turnover = None
+    weights_turnover = None  # Will be initialized as np.zeros(n_assets) upon first rebalance
 
-    # Data collection arrays for Strategy 2 (Baseline No-Turnover)
+    # Strategy 2 Data Structures (Baseline No-Turnover)
     strat_baseline_returns = []
-    active_baseline_count = []
     weights_baseline = None
 
     backtest_dates = []
@@ -36,51 +29,59 @@ def run_comprehensive_backtest(
         current_date = df_returns.index[t]
         daily_returns = df_returns.iloc[t].values
 
-        # --- 1. DAILY DRIFT TRACKING ---
+        # --- 1. DAILY WEIGHT DRIFT TRACKING ---
         if weights_turnover is not None:
             drifted_turnover = weights_turnover * (1 + daily_returns)
-            weights_turnover = drifted_turnover / np.sum(drifted_turnover)
+            # Handle zero-denominator edge case gracefully
+            if np.sum(drifted_turnover) > 0:
+                weights_turnover = drifted_turnover / np.sum(drifted_turnover)
+            else:
+                weights_turnover = np.ones(n_assets) / n_assets
 
         if weights_baseline is not None:
             drifted_baseline = weights_baseline * (1 + daily_returns)
-            weights_baseline = drifted_baseline / np.sum(drifted_baseline)
+            if np.sum(drifted_baseline) > 0:
+                weights_baseline = drifted_baseline / np.sum(drifted_baseline)
+            else:
+                weights_baseline = np.ones(n_assets) / n_assets
 
         # --- 2. REBALANCING WINDOW ---
         if (t - lookback_window) % rebalance_freq == 0:
-            window_data = df_returns.iloc[t - lookback_window : t]
+            window_data = df_returns.iloc[t - lookback_window:t]
+            
+            # Formulate parameters strictly bounded to the shape of the clean window data
             mu_window = window_data.mean().values * 252
             Q_window = window_data.cov().values * 252
 
-            # A. Optimize Strategy 1 (Passes genuine drifted weights baseline and tau)
-            w_drift_target = (
-                weights_turnover
-                if weights_turnover is not None
-                else np.zeros(n_assets)
-            )
+            # A. Strategy 1 Optimization (Turnover penalty applied)
+            w_drift_target = weights_turnover if weights_turnover is not None else np.zeros(n_assets)
+            
+            # Pass vectors that match the dimension of Q_window perfectly
             new_w_turnover = solve_large_sparse_portfolio(
-                mu_window,
-                Q_window,
-                lambda_val,
-                gamma_val,
-                w_drift=w_drift_target,
-                tau=tau_val,
+                mu_window, Q_window, lambda_val, gamma_val, 
+                w_drift=w_drift_target, tau=tau_val
             )
 
-            # B. Optimize Strategy 2 (Wipes slate clean: w_drift=None, tau=0.0)
+            # B. Strategy 2 Optimization (No turnover penalty)
             new_w_baseline = solve_large_sparse_portfolio(
-                mu_window, Q_window, lambda_val, gamma_val, w_drift=None, tau=0.0
+                mu_window, Q_window, lambda_val, gamma_val, 
+                w_drift=None, tau=0.0
             )
 
-            # Save allocations safely if optimization steps succeeded
+            # Clean and store allocations if solver is successful
             if new_w_turnover is not None:
-                new_w_turnover[new_w_turnover < 0.005] = 0.0
-                weights_turnover = new_w_turnover / np.sum(new_w_turnover)
-
+                new_w_turnover = np.array(new_w_turnover).flatten()
+                new_w_turnover[np.abs(new_w_turnover) < 1e-3] = 0.0
+                if np.sum(new_w_turnover) > 0:
+                    weights_turnover = new_w_turnover / np.sum(new_w_turnover)
+            
             if new_w_baseline is not None:
-                new_w_baseline[new_w_baseline < 0.005] = 0.0
-                weights_baseline = new_w_baseline / np.sum(new_w_baseline)
+                new_w_baseline = np.array(new_w_baseline).flatten()
+                new_w_baseline[np.abs(new_w_baseline) < 1e-3] = 0.0
+                if np.sum(new_w_baseline) > 0:
+                    weights_baseline = new_w_baseline / np.sum(new_w_baseline)
 
-        # --- 3. RECORD REALIZED RETURNS & ASSET COUNTS ---
+        # --- 3. RECORD DAILY RETURNS ---
         if weights_turnover is not None and weights_baseline is not None:
             ret_turnover = np.dot(weights_turnover, daily_returns)
             ret_baseline = np.dot(weights_baseline, daily_returns)
@@ -88,44 +89,27 @@ def run_comprehensive_backtest(
             strat_turnover_returns.append(ret_turnover)
             strat_baseline_returns.append(ret_baseline)
             backtest_dates.append(current_date)
+            active_turnover_count.append(np.sum(weights_turnover > 0.001))
 
-            active_turnover_count.append(np.sum(weights_turnover > 0))
-            active_baseline_count.append(np.sum(weights_baseline > 0))
+    # Compile results aligned with your timeline
+    results_df = pd.DataFrame({
+        "Strategy_Turnover": strat_turnover_returns,
+        "Strategy_Baseline": strat_baseline_returns,
+        "Active_Assets_Turnover": active_turnover_count
+    }, index=backtest_dates)
 
-    results_df = pd.DataFrame(
-        {
-            "Strategy_Turnover": strat_turnover_returns,
-            "Strategy_Baseline": strat_baseline_returns,
-            "Active_Assets_Turnover": active_turnover_count,
-            "Active_Assets_Baseline": active_baseline_count,
-        },
-        index=backtest_dates,
-    )
+    results_df["SP500"] = sp500_returns.loc[results_df.index]
     return results_df
 
-
-def evaluate_metrics(results_df, benchmark_returns):
-    """Computes and compares performance metrics with an external aligned benchmark series."""
+def evaluate_metrics(results_df):
     summary_table = {}
-    
-    # Force alignment across index vectors
-    results_df.index = pd.to_datetime(results_df.index).tz_localize(None)
-    benchmark_returns.index = pd.to_datetime(benchmark_returns.index).tz_localize(None)
-    
-    # Intersect to handle matching date shapes seamlessly
-    common_dates = results_df.index.intersection(benchmark_returns.index)
-    results_df = results_df.loc[common_dates]
-    
-    results_df["SPY_Benchmark"] = benchmark_returns.loc[common_dates]
-
     strategies = {
-        "Turnover Constrained (My Strategy)": "Strategy_Turnover",
-        "No Turnover Penalty (Baseline)": "Strategy_Baseline",
-        "S&P 500 Index (SPY Benchmark)": "SPY_Benchmark",
+        "Turnover Constrained Strategy": "Strategy_Turnover",
+        "No Turnover Penalty Baseline": "Strategy_Baseline",
+        "S&P 500 Index Benchmark (^GSPC)": "SP500"
     }
-
     for name, column in strategies.items():
-        returns = results_df[column]
+        returns = results_df[column].dropna()
         ann_return = (1 + returns.mean()) ** 252 - 1
         ann_vol = returns.std() * np.sqrt(252)
         sharpe = ann_return / ann_vol if ann_vol > 0 else 0.0
@@ -135,191 +119,154 @@ def evaluate_metrics(results_df, benchmark_returns):
             "Cumulative Return": f"{cum_return * 100:.2f}%",
             "Annualized Return": f"{ann_return * 100:.2f}%",
             "Annualized Volatility": f"{ann_vol * 100:.2f}%",
-            "Sharpe Ratio": f"{sharpe:.2f}",
+            "Sharpe Ratio": f"{sharpe:.2f}"
         }
-
     return pd.DataFrame(summary_table).T
 
-
-def plot_comparative_results(results_df):
-    """Generates a comparative plot tracking strategies against the SPY Index."""
-    results_df.index = pd.to_datetime(results_df.index).tz_localize(None)
+def plot_results_vs_sp500(results_df):
     fig, ax1 = plt.subplots(figsize=(12, 6))
-
     cum_turnover = (1 + results_df["Strategy_Turnover"]).cumprod() - 1
     cum_baseline = (1 + results_df["Strategy_Baseline"]).cumprod() - 1
-    cum_benchmark = (1 + results_df["SPY_Benchmark"]).cumprod() - 1
+    cum_sp500 = (1 + results_df["SP500"]).cumprod() - 1
 
-    # --- AXIS 1: LEFT SIDE (EQUITY TRAJECTORIES) ---
-    ax1.plot(
-        cum_turnover.index,
-        cum_turnover * 100,
-        label="Turnover Constrained Strategy (With w_drift)",
-        color="#1f77b4",
-        linewidth=2.5,
-        zorder=5,
-    )
-    ax1.plot(
-        cum_baseline.index,
-        cum_baseline * 100,
-        label="No Turnover Penalty Baseline (No w_drift)",
-        color="#d62728",
-        linestyle="-.",
-        linewidth=1.5,
-        zorder=4,
-    )
-    ax1.plot(
-        cum_benchmark.index,
-        cum_benchmark * 100,
-        label="S&P 500 Market Benchmark (SPY)",
-        color="#555555",  
-        linestyle="--",
-        linewidth=1.8,
-        zorder=3,
-    )
+    ax1.plot(cum_turnover.index, cum_turnover * 100, label="Turnover Constrained Portfolio", color="#1f77b4", linewidth=2.5)
+    ax1.plot(cum_baseline.index, cum_baseline * 100, label="No Turnover Penalty Baseline", color="#d62728", linestyle="-.", linewidth=1.5)
+    ax1.plot(cum_sp500.index, cum_sp500 * 100, label="S&P 500 Index Market (^GSPC)", color="#000000", linestyle="--", linewidth=2.0)
 
     ax1.set_xlabel("Date", fontsize=11, fontweight="bold")
     ax1.set_ylabel("Cumulative Return (%)", fontsize=11, fontweight="bold")
-    ax1.grid(True, linestyle=":", alpha=0.5, zorder=0)
+    ax1.grid(True, linestyle=":", alpha=0.5)
 
-    # --- AXIS 2: RIGHT SIDE (ASSET COUNTS) ---
     ax2 = ax1.twinx()
-    ax2.fill_between(
-        results_df.index,
-        results_df["Active_Assets_Turnover"],
-        step="post",       
-        color="#2ca02c",
-        alpha=0.06,       
-        label="Turnover Strategy Asset Count",
-        zorder=1
-    )
-
-    ax2.set_ylabel(
-        "Number of Active Tickers Held", fontsize=11, fontweight="bold", color="#2ca02c"
-    )
-    ax2.tick_params(axis="y", labelcolor="#2ca02c")
-    ax2.set_ylim(0, max(results_df["Active_Assets_Turnover"]) + 5)
-
-    ax1.set_zorder(ax2.get_zorder() + 1)
-    ax1.patch.set_visible(False)
+    ax2.fill_between(results_df.index, results_df["Active_Assets_Turnover"], step="pre", color="#2ca02c", alpha=0.05, label="Selected Assets Count")
+    ax2.set_ylabel("Number of Assets Selected", color="#2ca02c", fontweight="bold")
+    ax2.tick_params(axis='y', labelcolor="#2ca02c")
 
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", framealpha=0.9)
 
-    plt.title(
-        "Strategy vs Actual S&P 500 Index (SPY) Comparison Matrix",
-        fontsize=13,
-        fontweight="bold",
-        pad=15,
-    )
+    plt.title("Strategy Execution Vector vs. S&P 500 Index Market Benchmark", fontsize=13, fontweight="bold", pad=15)
     fig.tight_layout()
-
-    plt.savefig("spy_market_strategy_comparison.png", dpi=300)
-    print("\nVisual plot generated vs SPY Market Index.")
+    plt.savefig("strategy_vs_sp500.png", dpi=300)
     plt.show()
 
-
-def download_single_ticker(ticker):
-    """Downloads a single asset and handles formatting to eliminate multi-index corruption."""
-    try:
-        df = yf.download(ticker, start="2015-01-01", end="2026-01-01", progress=False)
-        if df.empty:
-            return ticker, None
-        
-        # Unpack MultiIndex columns if present
-        if isinstance(df.columns, pd.MultiIndex):
-            col_field = "Adj Close" if "Adj Close" in df.columns.levels[0] else "Close"
-            series = df[col_field][ticker]
-        else:
-            col_field = "Adj Close" if "Adj Close" in df.columns else "Close"
-            series = df[col_field]
-            
-        # Standardize index timeline
-        series.index = pd.to_datetime(series.index).tz_localize(None)
-        return ticker, series
-    except Exception:
-        return ticker, None
-
-
 if __name__ == "__main__":
-    print("Scraping comprehensive list of current S&P 500 tickers from Wikipedia...")
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    req = urllib.request.Request(
-        url, 
-        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    sp500_string = """
+    AAPL MSFT NVDA AMZN GOOGL GOOG AVGO TSLA META MU
+    BRK-B LLY WMT AMD JPM INTC V XOM JNJ ORCL
+    AMAT LRCX CSCO CAT MA COST BAC ABBV GE UNH
+    MS CVX PG KLAC KO SNDK HD GS NFLX PLTR
+    GEV TXN MRK PM MRVL WDC DELL WFC STX RTX
+    C QCOM LIN PANW IBM AXP ANET ADI APH MCD
+    TMUS PEP VZ AMGN NEE TJX DIS BA CRWD GLW
+    LOW NKE SBUX BK HWM GEHC PM AXON CMCSA SYK
+    INTU BLDR FIS AMD CRM DHR ELV ISRG CI CB
+    LMT UPS ABT BLK ACN NOW MDT CAT FI REGN
+    HON PLD LULU DE BSX SCHW ADSK QCOM MO COR
+    ETN MU DE MDT ECL SYK ADI PANW BKR EW
+    LRCX FIS APD PH SNPS ZTS TT WELL KLAC ITW
+    VRTX FTNT FDX COF LRCX HCA NVR CTAS APD AJG
+    TT AON BMY TRV FICO EMR PGR MCO NOC GD
+    FCX MET MET NSC CEG GWW RMD NXPI TFC ORLY
+    SRE SPLK MCK CME FSLR STLD WM MAR AMP MPC
+    GILD GIS LHX JCI NUE ADSK ADM WBD FICO AEE
+    EOG PCG MSI COF CNC STT DXCM PSX CPS SNPS
+    PAYX TRGP PH SRE SYY DFS HLT PPW KMI KDP
+    PCAR NEM ALGN CINF HEI PEG FTV AEP CDW PRU
+    ALL WST FITB DUK GDDY EXR VLO VTRS FAST PCG
+    TRMB ADM TRV VRSK CPAY STE KR ED FE BAX
+    O PAYC SO ODFL DLR LNT ALGN DLTR SBAC WELL
+    DLTR CEG AON EQR VMC IDXX KEYS A CMI DOW
+    CTRA AWK DUK HIG EQT LUV DLR DG KSB OTIS
+    OKE STT EXPE WEC WTW GRMN TSCO AVB K KSS
+    URI GPN HRL BLK SYY CHD BG KEY CTSH GL
+    INVH EBAY HPQ DOV FTV TSN FDX CE RJF BRO
+    WST SWKS CAH CDW KMX APA BBY EXR VLO CTAS
+    VMC EXPE WBA JKHY HAS HOLX BEN IP CLX ESS
+    MGM WRB TYL ALK NI ATO TECH LNT TFX TECH
+    NDAQ AKAM IPG REG CRL NTAP JKHY GEN DRI HRL
+    POOL PODD MAS EVRG LKQ JBHT FRT DPZ CNP CPRT
+    KMX AES AAP SWK MHK RE NWL SEE XRAY LUMN
+    CZR GNRC NXP PENN FLS SLG VNT XRX PTC MRNA
+    BBWI FDS SBNY SEDG HBI LEG WU WTW MOH CPT
+    VICI KDP ON IPGP UA UAA ELV CSGP INVH EQT
+    PCG CTXS DRE TRGP ACGL GEN FSLR STLD GEHC
+    BG PODD FICO LUMN AXON RVTY FI PANW EG KVUE
+    COR ABNB BX LNC NWL VLTO DXC BLDR HUBB JBL
+    LULU UBER ALK ATVI OGN SEDG SEE DAY DOC DECK
+    SMCI WHR ZION CPAY FLT GEV SOLV VFC XRAY VST
+    PXD CRWD GDDY KKR CMA ILMN RHI SW WRK DELL
+    ERIE TPL MRO APO LII WDAY DASH EXE TKO WSM
+    BWA CE FMC COIN DDOG JNPR TTD ANSS XYZ HES
+    PSKY IBKR WBA APP EME HOOD SOLS Q EMN FISV
+    """
+    
+    # Force clean tokenization and remove duplicates
+    raw_tickers = [t.strip() for t in sp500_string.split() if t.strip()]
+    raw_tickers = list(set(raw_tickers))
+
+    print("Fetching data profiles from Yahoo Finance...")
+
+    # 1. Download benchmark index
+    df_bench_raw = yf.download("^GSPC", start="2015-01-01", end="2026-01-01", progress=False)
+    sp500_series = df_bench_raw['Adj Close'] if 'Adj Close' in df_bench_raw.columns else df_bench_raw['Close']
+    sp500_series = sp500_series.squeeze().ffill()
+
+    # 2. Download stock universe using the robust group_by="ticker" layout
+    chunk_size = 40
+    valid_stock_series = {}
+    
+    for i in range(0, len(raw_tickers), chunk_size):
+        chunk = raw_tickers[i:i + chunk_size]
+        df_chunk_raw = yf.download(chunk, start="2015-01-01", end="2026-01-01", group_by="ticker", progress=False)
+        
+        for ticker in chunk:
+            try:
+                if ticker in df_chunk_raw.columns.levels[0]:
+                    ticker_df = df_chunk_raw[ticker]
+                    series = ticker_df['Adj Close'] if 'Adj Close' in ticker_df.columns else ticker_df['Close']
+                    series = series.squeeze()
+                    if not series.dropna().empty:
+                        valid_stock_series[ticker] = series
+            except Exception:
+                continue
+
+    # Reconstruct the structural master frame
+    df_stocks = pd.DataFrame(valid_stock_series)
+
+    # 3. Clean and filter based on a 90% completion rule over the historical timeline
+    min_data_rows = int(len(df_stocks) * 0.90)
+    df_stocks_clean = df_stocks.dropna(axis=1, thresh=min_data_rows)
+    cleaned_stocks = df_stocks_clean.ffill().bfill().dropna()
+
+    # 4. Sync timeline intersections perfectly
+    common_idx = cleaned_stocks.index.intersection(sp500_series.index)
+    cleaned_stocks = cleaned_stocks.loc[common_idx]
+    sp500_series = sp500_series.loc[common_idx]
+
+    # 5. Formulate final percent returns profiles
+    stock_returns = cleaned_stocks.pct_change().dropna()
+    sp500_returns = sp500_series.pct_change().dropna()
+
+    print(f"\nData matrix stabilized at: {stock_returns.index[0].strftime('%Y-%m-%d')}")
+    print(f"Simulating across {stock_returns.shape[1]} clean, high-fidelity long-history S&P 500 equities...")
+
+    # Strategy Execution Parameters
+    lambda_val = 0.35  
+    gamma_val = 0.04  
+    tau_val = 0.015    
+
+    print("Initiating portfolio optimization loop...\n")
+    results = run_sp500_backtest(
+        stock_returns, sp500_returns,
+        lookback_window=252, rebalance_freq=21,
+        lambda_val=lambda_val, gamma_val=gamma_val, tau_val=tau_val
     )
-    
-    try:
-        with urllib.request.urlopen(req) as response:
-            html_content = response.read()
-        payload = pd.read_html(html_content, attrs={"id": "constituents"})[0]
-        raw_tickers = [str(t).replace(".", "-").strip() for t in payload["Symbol"].tolist()]
-        print(f"Successfully scraped {len(raw_tickers)} ticker components from Wikipedia.")
-    except Exception as e:
-        print(f"Scraping encountered an error ({e}). Falling back to manual fallback list...")
-        raw_tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "BRK-B", "JPM", "UNH", "V"]
 
-    # 1. Isolate market benchmark data
-    print("\nDownloading SPY Benchmark Index...")
-    _, spy_series = download_single_ticker("SPY")
-    if spy_series is None:
-        raise RuntimeError("Critical Error: SPY Benchmark failed to download. Check network connection.")
-    spy_returns = spy_series.pct_change().dropna()
+    metrics_df = evaluate_metrics(results)
+    print("\n=================== FINAL PERFORMANCE MATRIX VS S&P 500 ===================")
+    print(metrics_df.to_string())
+    print("===========================================================================")
 
-    # 2. Process data downloads using an isolated parallel loop
-    print(f"Launching parallel execution threads to download {len(raw_tickers)} assets...")
-    price_dictionary = {}
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        future_to_ticker = {executor.submit(download_single_ticker, tick): tick for tick in raw_tickers}
-        for future in concurrent.futures.as_completed(future_to_ticker):
-            ticker, series = future.result()
-            # Verify data is returned as a valid Series before adding it to the tracking matrix
-            if series is not None and isinstance(series, pd.Series) and len(series) > 0:
-                price_dictionary[ticker] = series
-
-    # Secure asset matrix construction
-    component_prices = pd.DataFrame(price_dictionary)
-    component_prices.index = pd.to_datetime(component_prices.index).tz_localize(None)
-
-    print("\nFiltering asset timeline maturities to secure a clean 2016 engine startup...")
-    
-    # Filter out assets missing more than 10% of their historical data points
-    total_expected_days = len(component_prices.index)
-    valid_counts = component_prices.notna().sum(axis=0)
-    min_required_days = int(total_expected_days * 0.90)
-    
-    mature_tickers = valid_counts[valid_counts >= min_required_days].index.tolist()
-    component_prices = component_prices[mature_tickers]
-
-    # Forward-fill gaps, then clean drop lingering structural initialization records
-    component_prices = component_prices.ffill()
-    cleaned_components = component_prices.dropna(axis=1)
-
-    print(f"Data matrix stabilized. Dropped {len(raw_tickers) - cleaned_components.shape[1]} young assets.")
-    print(f"Simulating across {cleaned_components.shape[1]} long-history S&P components.")
-    
-    daily_returns = cleaned_components.pct_change().dropna()
-
-    # --- Hyperparameters ---
-    lambda_val = 2.0
-    gamma_val = 0.0
-    tau_val = 0.05
-
-    print("\nInitiating massive 500-asset twin-engine backtest loop simulation...\n")
-    results = run_comprehensive_backtest(
-        daily_returns,
-        lookback_window=252,
-        rebalance_freq=21,
-        lambda_val=lambda_val,
-        gamma_val=gamma_val,
-        tau_val=tau_val,
-    )
-
-    comparison_metrics = evaluate_metrics(results, spy_returns)
-    print("\n========================= PERFORMANCE SUMMARY TABLE =========================")
-    print(comparison_metrics.to_string())
-    print("=============================================================================")
-
-    plot_comparative_results(results)
+    plot_results_vs_sp500(results)
