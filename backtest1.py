@@ -253,14 +253,14 @@ if __name__ == "__main__":
     print(f"Simulating across {stock_returns.shape[1]} clean, high-fidelity long-history S&P 500 equities...")
 
     # Strategy Execution Parameters
-    lambda_val = 0.35  
-    gamma_val = 0.04  
-    tau_val = 0.015    
+    lambda_val = 0.1  
+    gamma_val = 0.03  
+    tau_val = 0.05    
 
     print("Initiating portfolio optimization loop...\n")
     results = run_sp500_backtest(
         stock_returns, sp500_returns,
-        lookback_window=252, rebalance_freq=21,
+        lookback_window=504, rebalance_freq=21,
         lambda_val=lambda_val, gamma_val=gamma_val, tau_val=tau_val
     )
 
