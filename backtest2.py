@@ -313,7 +313,7 @@ def plot_results_vs_sp500(results_df):
 
     plt.title("Integrated Strategy Vector Performance vs S&P 500 Index Benchmark Universe", fontsize=13, fontweight="bold", pad=15)
     fig.tight_layout()
-    plt.savefig("integrated_strategy_vs_sp500.png", dpi=300)
+    plt.savefig("integrated_strategy_vs_sp500_return-risk.png", dpi=300)
     plt.show()
 
 # ==============================================================================
@@ -386,10 +386,10 @@ if __name__ == "__main__":
     print(f"\nData matrices synchronized at date boundary: {stock_returns.index[0].strftime('%Y-%m-%d')}")
     print(f"Total processed portfolio components: {stock_returns.shape[1]} S&P 500 equities.")
 
-    # Execution Settings: 504 observation lookback (~2 trading years), rebalancing every 21 days (monthly)
+    # Execution Settings: 252 observation lookback (~1 trading year), rebalancing every 21 days (monthly)
     results = run_sp500_backtest(
         stock_returns, sp500_returns,
-        lookback_window=504, rebalance_freq=21, lambda_tc=0.0010 # 50 bps execution penalty friction
+        lookback_window=252, rebalance_freq=21, lambda_tc=0.0010 # 50 bps execution penalty friction
     )
 
     metrics_df = evaluate_metrics(results)
