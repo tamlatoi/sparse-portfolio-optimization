@@ -313,7 +313,7 @@ def plot_results_vs_sp500(results_df):
 
     plt.title("Integrated Strategy Vector Performance vs S&P 500 Index Benchmark Universe", fontsize=13, fontweight="bold", pad=15)
     fig.tight_layout()
-    plt.savefig("integrated_strategy_vs_sp500_return-risk.png", dpi=300)
+    plt.savefig("integrated_strategy_vs_sp500.png", dpi=300)
     plt.show()
 
 # ==============================================================================
