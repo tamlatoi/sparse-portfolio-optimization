@@ -111,13 +111,22 @@ def nested_clustered_optimization(returns, base_cov):
 # 3. PURE TURNOVER CONSTRAINED CVAR OPTIMIZER
 # ==============================================================================
 
-def optimize_portfolio_cvar(historical_scenarios, cov_matrix, mu, w_initial, lamb=1.0, tau=0.0010):
+def optimize_portfolio_cvar(historical_scenarios, cov_matrix, mu, w_initial, lamb=1.0, tau=0.01):
     S, N = historical_scenarios.shape
     scenarios_matrix = np.asarray(historical_scenarios)
     
     cov_matrix = np.nan_to_num(cov_matrix)
     mu = np.nan_to_num(mu)
     stabilized_cov = cov_matrix + np.eye(N) * 1e-6
+    
+    # Calculate Dynamic CVaR baseline limits based on equal weight profile
+    eq_weights = np.ones(N) / N
+    equal_weight_scenarios = -scenarios_matrix @ eq_weights
+    base_95_cvar = np.percentile(equal_weight_scenarios, 95)
+    base_99_cvar = np.percentile(equal_weight_scenarios, 99)
+    
+    max_allowable_95_cvar = max(0.10, base_95_cvar * 0.95)
+    max_allowable_99_cvar = max(0.16, base_99_cvar * 0.95)
     
     w = cp.Variable(N)
     zeta_95 = cp.Variable()
@@ -136,14 +145,15 @@ def optimize_portfolio_cvar(historical_scenarios, cov_matrix, mu, w_initial, lam
     constraints = [
         cp.sum(w) == 1.0,
         w >= 0.0,
+        w <= 0.08, # Force core diversification profile across multi-collinear clusters
         
         z_95 >= 0.0,
         (-scenarios_matrix @ w) - zeta_95 <= z_95,
-        zeta_95 + (1.0 / (1.0 - 0.95)) * cp.mean(z_95) <= 0.12, 
+        zeta_95 + (1.0 / (1.0 - 0.95)) * cp.mean(z_95) <= max_allowable_95_cvar, 
         
         z_99 >= 0.0,
         (-scenarios_matrix @ w) - zeta_99 <= z_99,
-        zeta_99 + (1.0 / (1.0 - 0.99)) * cp.mean(z_99) <= 0.20
+        zeta_99 + (1.0 / (1.0 - 0.99)) * cp.mean(z_99) <= max_allowable_99_cvar
     ]
     
     prob = cp.Problem(objective, constraints)
@@ -157,7 +167,7 @@ def optimize_portfolio_cvar(historical_scenarios, cov_matrix, mu, w_initial, lam
             
     if prob.status not in ["optimal", "optimal_inaccurate"] or w.value is None:
         fallback_objective = cp.Minimize(portfolio_risk + turnover_regularization)
-        prob_fallback = cp.Problem(fallback_objective, [cp.sum(w) == 1.0, w >= 0.0])
+        prob_fallback = cp.Problem(fallback_objective, [cp.sum(w) == 1.0, w >= 0.0, w <= 0.08])
         prob_fallback.solve(solver=cp.CLARABEL)
         
     return w.value
@@ -166,7 +176,7 @@ def optimize_portfolio_cvar(historical_scenarios, cov_matrix, mu, w_initial, lam
 # 4. SIMULATION BACKTEST ENGINE
 # ==============================================================================
 
-def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance_freq=21, lamb=1.0, tau=0.0010):
+def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance_freq=21, lamb=1.0, tau=0.01):
     n_timesteps, n_assets = df_returns.shape
 
     strat_robust_returns = []
@@ -200,7 +210,8 @@ def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance
                 raw_gerber = robust_gerber_covariance_mad(active_window_returns, c=0.4)
                 w_nco = nested_clustered_optimization(active_window_returns, raw_gerber)
                 
-                active_mu = active_window_returns.mean().values * 252.0 * w_nco
+                # FIXED: Calculate raw annualized mean expected return vector
+                active_mu = active_window_returns.mean().values * 252.0
                 gerber_cov = de_noise_covariance(raw_gerber, active_scenarios.shape[0], active_scenarios.shape[1])
                 
                 if t == lookback_window:
@@ -262,26 +273,56 @@ def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance
 if __name__ == "__main__":
     # CHOOSE YOUR FIXED TUNING VALUES HERE
     CHOSEN_LAMBDA = 0.1
-    CHOSEN_TAU = 0.5
+    CHOSEN_TAU = 0.05
 
     sp500_string = """
-    AAPL MSFT NVDA AMZN GOOGL GOOG AVGO TSLA META MU BRK-B LLY WMT AMD JPM INTC V XOM JNJ ORCL
-    AMAT LRCX CSCO CAT MA COST BAC ABBV GE UNH MS CVX PG KLAC KO HD GS NFLX PLTR GEV TXN MRK
-    PM MRVL WDC DELL WFC STX RTX C QCOM LIN PANW IBM AXP ANET ADI APH MCD TMUS PEP VZ AMGN
-    NEE TJX DIS BA CRWD GLW LOW NKE SBUX BK HWM GEHC CMCSA SYK INTU BLDR FIS CRM DHR ELV ISRG
-    CI CB LMT UPS ABT BLK ACN NOW MDT FI REGN HON PLD LULU DE BSX SCHW ADSK MO COR ETN ECL TT
-    WELL ITW VRTX FTNT FDX COF HCA NVR CTAS AJG AON BMY TRV FICO EMR PGR MCO NOC GD FCX MET NSC
-    CEG GWW RMD NXPI TFC ORLY SRE MCK CME FSLR STLD WM MAR AMP MPC GILD GIS LHX JCI NUE ADM WBD
-    AEE EOG PCG MSI CNC STT DXCM PSX CPS PAYX TRGP SYY DFS HLT PPW KMI KDP PCAR NEM ALGN CINF
-    HEI PEG FTV AEP CDW PRU ALL WST FITB DUK GDDY EXR VLO VTRS FAST KR ED FE BAX O PAYC
-    SO ODFL DLR LNT DLTR SBAC VMC IDXX KEYS A CMI DOW CTRA AWK HIG EQT LUV DG KSB OTIS OKE
-    WEC WTW GRMN TSCO AVB K URI GPN HRL CHD BG KEY CTSH GL INVH EBAY HPQ DOV TSN RJF BRO SWKS
-    CAH KMX APA BBY WBA JKHY HAS HOLX BEN IP CLX ESS MGM WRB TYL ALK NI ATO TECH TFX NDAQ
-    AKAM IPG REG CRL NTAP GEN DRI POOL PODD MAS EVRG LKQ JBHT FRT DPZ CNP CPRT AES AAP SWK
-    MHK RE NWL SEE XRAY LUMN CZR GNRC NXP PENN FLS SLG VNT XRX PTC MRNA BBWI FDS WU MOH
-    CPT VICI ON IPGP UA UAA CSGP ACGL VLTO DXC HUBB JBL UBER OGN DAY DOC DECK SMCI WHR
-    ZION SOLV VFC VST KKR CMA ILMN RHI SW WSM ERIE TPL MRO APO LII WDAY DASH EXE TKO BWA
-    CE FMC COIN DDOG JNPR TTD ANSS HES PSKY IBKR APP EME HOOD SOLS Q EMN FISV
+    AAPL MSFT NVDA AMZN GOOGL GOOG AVGO TSLA META MU
+    BRK-B LLY WMT AMD JPM INTC V XOM JNJ ORCL
+    AMAT LRCX CSCO CAT MA COST BAC ABBV GE UNH
+    MS CVX PG KLAC KO SNDK HD GS NFLX PLTR
+    GEV TXN MRK PM MRVL WDC DELL WFC STX RTX
+    C QCOM LIN PANW IBM AXP ANET ADI APH MCD
+    TMUS PEP VZ AMGN NEE TJX DIS BA CRWD GLW
+    LOW NKE SBUX BK HWM GEHC PM AXON CMCSA SYK
+    INTU BLDR FIS AMD CRM DHR ELV ISRG CI CB
+    LMT UPS ABT BLK ACN NOW MDT CAT FI REGN
+    HON PLD LULU DE BSX SCHW ADSK QCOM MO COR
+    ETN MU DE MDT ECL SYK ADI PANW BKR EW
+    LRCX FIS APD PH SNPS ZTS TT WELL KLAC ITW
+    VRTX FTNT FDX COF LRCX HCA NVR CTAS APD AJG
+    TT AON BMY TRV FICO EMR PGR MCO NOC GD
+    FCX MET MET NSC CEG GWW RMD NXPI TFC ORLY
+    SRE SPLK MCK CME FSLR STLD WM MAR AMP MPC
+    GILD GIS LHX JCI NUE ADSK ADM WBD FICO AEE
+    EOG PCG MSI COF CNC STT DXCM PSX CPS SNPS
+    PAYX TRGP PH SRE SYY DFS HLT PPW KMI KDP
+    PCAR NEM ALGN CINF HEI PEG FTV AEP CDW PRU
+    ALL WST FITB DUK GDDY EXR VLO VTRS FAST PCG
+    TRMB ADM TRV VRSK CPAY STE KR ED FE BAX
+    O PAYC SO ODFL DLR LNT ALGN DLTR SBAC WELL
+    DLTR CEG AON EQR VMC IDXX KEYS A CMI DOW
+    CTRA AWK DUK HIG EQT LUV DLR DG KSB OTIS
+    OKE STT EXPE WEC WTW GRMN TSCO AVB K KSS
+    URI GPN HRL BLK SYY CHD BG KEY CTSH GL
+    INVH EBAY HPQ DOV FTV TSN FDX CE RJF BRO
+    WST SWKS CAH CDW KMX APA BBY EXR VLO CTAS
+    VMC EXPE WBA JKHY HAS HOLX BEN IP CLX ESS
+    MGM WRB TYL ALK NI ATO TECH LNT TFX TECH
+    NDAQ AKAM IPG REG CRL NTAP JKHY GEN DRI HRL
+    POOL PODD MAS EVRG LKQ JBHT FRT DPZ CNP CPRT
+    KMX AES AAP SWK MHK RE NWL SEE XRAY LUMN
+    CZR GNRC NXP PENN FLS SLG VNT XRX PTC MRNA
+    BBWI FDS SBNY SEDG HBI LEG WU WTW MOH CPT
+    VICI KDP ON IPGP UA UAA ELV CSGP INVH EQT
+    PCG CTXS DRE TRGP ACGL GEN FSLR STLD GEHC
+    BG PODD FICO LUMN AXON RVTY FI PANW EG KVUE
+    COR ABNB BX LNC NWL VLTO DXC BLDR HUBB JBL
+    LULU UBER ALK ATVI OGN SEDG SEE DAY DOC DECK
+    SMCI WHR ZION CPAY FLT GEV SOLV VFC XRAY VST
+    PXD CRWD GDDY KKR CMA ILMN RHI SW WRK DELL
+    ERIE TPL MRO APO LII WDAY DASH EXE TKO WSM
+    BWA CE FMC COIN DDOG JNPR TTD ANSS XYZ HES
+    PSKY IBKR WBA APP EME HOOD SOLS Q EMN FISV
     """
     
     raw_tickers = list(set([t.strip() for t in sp500_string.split() if t.strip()]))
@@ -314,7 +355,8 @@ if __name__ == "__main__":
     df_stocks = df_stocks.loc[common_idx]
     sp500_series = sp500_series.loc[common_idx]
 
-    stock_returns = df_stocks.ffill().pct_change().fillna(0.0)
+    # FIXED: Handled deprecation warning via explicitly declaring fill_method=None
+    stock_returns = df_stocks.ffill().pct_change(fill_method=None).fillna(0.0)
     sp500_returns = sp500_series.pct_change().dropna()
 
     print(f"\nRunning target profile using Lambda={CHOSEN_LAMBDA}, Tau={CHOSEN_TAU}...")
@@ -325,7 +367,57 @@ if __name__ == "__main__":
     cum_eq = (1 + res["Strategy_EqualWeight"]).cumprod() - 1
     cum_sp500 = (1 + res["SP500"]).cumprod() - 1
 
-    # GENERATE DUAL-AXIS PERFORMANCE PLOT
+    # ==============================================================================
+    # 6. PERFORMANCE METRICS ENGINE
+    # ==============================================================================
+    
+    def print_performance_metrics(returns_df):
+        metrics = {}
+        trading_days = 252
+        
+        for column in ["Strategy_Robust", "Strategy_EqualWeight", "SP500"]:
+            rets = returns_df[column].values
+            
+            # Annualized Return (Geometric Compounding)
+            total_ret = (1 + rets).prod()
+            n_days = len(rets)
+            ann_return = (total_ret) ** (trading_days / n_days) - 1
+            
+            # Annualized Volatility
+            ann_vol = np.std(rets, ddof=1) * np.sqrt(trading_days)
+            
+            # Sharpe Ratio (Assuming 0% Risk-Free Rate)
+            sharpe = ann_return / ann_vol if ann_vol > 0 else 0
+            
+            # Maximum Drawdown tracking array
+            cum_rets = (1 + rets).cumprod()
+            running_max = np.maximum.accumulate(cum_rets)
+            running_max = np.where(running_max == 0, 1.0, running_max)
+            drawdowns = (cum_rets - running_max) / running_max
+            max_dd = np.min(drawdowns)
+            
+            metrics[column] = {
+                "Total Return (%)": (total_ret - 1) * 100,
+                "Annualized Return (%)": ann_return * 100,
+                "Annualized Volatility (%)": ann_vol * 100,
+                "Sharpe Ratio": sharpe,
+                "Max Drawdown (%)": max_dd * 100
+            }
+            
+        summary_df = pd.DataFrame(metrics).round(2)
+        print("\n" + "="*60)
+        print("          BACKTEST PERFORMANCE PORTFOLIO METRICS")
+        print("="*60)
+        print(summary_df.to_string())
+        print("="*60 + "\n")
+        return summary_df
+
+    # Execute metrics print calculation out to terminal
+    summary_metrics = print_performance_metrics(res)
+
+    # ==============================================================================
+    # 7. GENERATE DUAL-AXIS PERFORMANCE PLOT
+    # ==============================================================================
     fig, ax1 = plt.subplots(figsize=(14, 7))
 
     # Left Axis: Cumulative Performance (Percentages)
@@ -348,5 +440,5 @@ if __name__ == "__main__":
     
     # Save chart locally
     plt.savefig("integrated_strategy_performance.png", dpi=300)
-    print("\nSimulation complete. Performance graph saved to integrated_strategy_performance.png")
+    print("Simulation complete. Performance graph saved to integrated_strategy_performance.png")
     plt.show()
