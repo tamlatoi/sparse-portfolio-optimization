@@ -275,6 +275,9 @@ if __name__ == "__main__":
     CHOSEN_LAMBDA = 0.1
     CHOSEN_TAU = 0.05
 
+    from curl_cffi.requests import Session
+    scraper_session = Session(impersonate="chrome")
+
     sp500_string = """
     AAPL MSFT NVDA AMZN GOOGL GOOG AVGO TSLA META MU
     BRK-B LLY WMT AMD JPM INTC V XOM JNJ ORCL
@@ -328,7 +331,7 @@ if __name__ == "__main__":
     raw_tickers = list(set([t.strip() for t in sp500_string.split() if t.strip()]))
     print(f"Ingesting data target profiles for {len(raw_tickers)} equity tickers...")
 
-    df_bench_raw = yf.download("^GSPC", start="2016-01-01", end="2026-01-01", auto_adjust=True, progress=False)
+    df_bench_raw = yf.download("^GSPC", start="2016-01-01", end="2026-01-01", auto_adjust=True, progress=False, session=scraper_session)
     if isinstance(df_bench_raw.columns, pd.MultiIndex):
         sp500_series = df_bench_raw.xs('Close', axis=1, level=0).squeeze()
     else:
@@ -339,7 +342,7 @@ if __name__ == "__main__":
     valid_stock_series = {}
     for i in range(0, len(raw_tickers), chunk_size):
         chunk = raw_tickers[i:i + chunk_size]
-        df_chunk_raw = yf.download(chunk, start="2016-01-01", end="2026-01-01", auto_adjust=True, progress=False)
+        df_chunk_raw = yf.download(chunk, start="2016-01-01", end="2026-01-01", auto_adjust=True, progress=False, session=scraper_session)
         if isinstance(df_chunk_raw.columns, pd.MultiIndex):
             df_close = df_chunk_raw.xs('Close', axis=1, level=0)
         else:
