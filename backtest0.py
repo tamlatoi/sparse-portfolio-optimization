@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# Import my core optimization engine cleanly from main.py
+# Import your core optimization engine cleanly from main.py
 from main import solve_large_sparse_portfolio
 
 
@@ -18,12 +18,11 @@ def run_comprehensive_backtest(
     """Simulates both the turnover-constrained and the baseline no-turnover portfolios simultaneously."""
     n_timesteps, n_assets = df_returns.shape
 
-    # Data collection arrays for Strategy 1 (Turnover Constrained)
+    # Data collection arrays
     strat_turnover_returns = []
     active_turnover_count = []
     weights_turnover = None
 
-    # Data collection arrays for Strategy 2 (Baseline No-Turnover)
     strat_baseline_returns = []
     active_baseline_count = []
     weights_baseline = None
@@ -34,26 +33,20 @@ def run_comprehensive_backtest(
         current_date = df_returns.index[t]
         daily_returns = df_returns.iloc[t].values
 
-        # --- 1. DAILY DRIFT TRACKING ---
-        if weights_turnover is not None:
-            drifted_turnover = weights_turnover * (1 + daily_returns)
-            weights_turnover = drifted_turnover / np.sum(drifted_turnover)
-
-        if weights_baseline is not None:
-            drifted_baseline = weights_baseline * (1 + daily_returns)
-            weights_baseline = drifted_baseline / np.sum(drifted_baseline)
-
-        # --- 2. REBALANCING WINDOW ---
+        # --- 1. REBALANCING WINDOW (Executed at the START of the day/period) ---
         if (t - lookback_window) % rebalance_freq == 0:
             window_data = df_returns.iloc[t - lookback_window : t]
-            mu_window = window_data.mean().values * 252
+
+            n_days = window_data.shape[0]
+            terminal_wealth = (1.0 + window_data).prod(axis=0)
+            terminal_wealth = np.maximum(1e-5, terminal_wealth.values)
+
+            mu_window = (terminal_wealth) ** (252.0 / n_days) - 1.0
             Q_window = window_data.cov().values * 252
 
-            # A. Optimize Strategy 1 (Passes genuine drifted weights baseline and tau)
+            # A. Optimize Strategy 1 (Uses weights drifted from the PREVIOUS day's close)
             w_drift_target = (
-                weights_turnover
-                if weights_turnover is not None
-                else np.zeros(n_assets)
+                weights_turnover if weights_turnover is not None else np.zeros(n_assets)
             )
             new_w_turnover = solve_large_sparse_portfolio(
                 mu_window,
@@ -64,34 +57,43 @@ def run_comprehensive_backtest(
                 tau=tau_val,
             )
 
-            # B. Optimize Strategy 2 (Wipes slate clean: w_drift=None, tau=0.0)
+            # B. Optimize Strategy 2
             new_w_baseline = solve_large_sparse_portfolio(
                 mu_window, Q_window, lambda_val, gamma_val, w_drift=None, tau=0.0
             )
 
-            # Save allocations safely if optimization steps succeeded
             if new_w_turnover is not None:
                 new_w_turnover[np.abs(new_w_turnover) < 1e-4] = 0.0
                 weights_turnover = new_w_turnover / np.sum(new_w_turnover)
+            elif weights_turnover is None:
+                weights_turnover = np.ones(n_assets) / n_assets  # Fallback allocation
 
             if new_w_baseline is not None:
                 new_w_baseline[np.abs(new_w_baseline) < 1e-4] = 0.0
                 weights_baseline = new_w_baseline / np.sum(new_w_baseline)
+            elif weights_baseline is None:
+                weights_baseline = np.ones(n_assets) / n_assets
 
-        # --- 3. RECORD REALIZED RETURNS & ASSET COUNTS ---
-        if weights_turnover is not None and weights_baseline is not None:
-            ret_turnover = np.dot(weights_turnover, daily_returns)
-            ret_baseline = np.dot(weights_baseline, daily_returns)
+        # --- 2. RECORD REALIZED RETURNS ---
+        # Calculate returns using the weights that ENTERED the trading day
+        ret_turnover = np.dot(weights_turnover, daily_returns)
+        ret_baseline = np.dot(weights_baseline, daily_returns)
 
-            strat_turnover_returns.append(ret_turnover)
-            strat_baseline_returns.append(ret_baseline)
-            backtest_dates.append(current_date)
+        strat_turnover_returns.append(ret_turnover)
+        strat_baseline_returns.append(ret_baseline)
+        backtest_dates.append(current_date)
 
-            # Track structural sparse portfolio density changes
-            active_turnover_count.append(np.sum(weights_turnover > 0))
-            active_baseline_count.append(np.sum(weights_baseline > 0))
+        active_turnover_count.append(np.sum(weights_turnover > 0))
+        active_baseline_count.append(np.sum(weights_baseline > 0))
 
-    # Combine historical streams into a structured summary dataframe
+        # --- 3. END-OF-DAY DRIFT TRACKING ---
+        # Drift allocations based on today's market movements to prepare for tomorrow
+        drifted_turnover = weights_turnover * (1 + daily_returns)
+        weights_turnover = drifted_turnover / np.sum(drifted_turnover)
+
+        drifted_baseline = weights_baseline * (1 + daily_returns)
+        weights_baseline = drifted_baseline / np.sum(drifted_baseline)
+
     results_df = pd.DataFrame(
         {
             "Strategy_Turnover": strat_turnover_returns,
@@ -118,10 +120,14 @@ def evaluate_metrics(results_df, df_returns):
 
     for name, column in strategies.items():
         returns = results_df[column]
-        ann_return = (1 + returns.mean()) ** 252 - 1
+        n_days = len(returns)
+
+        total_growth = (1 + returns).prod()
+        ann_return = (total_growth) ** (252.0 / n_days) - 1.0
+
         ann_vol = returns.std() * np.sqrt(252)
         sharpe = ann_return / ann_vol if ann_vol > 0 else 0.0
-        cum_return = (1 + returns).cumprod().iloc[-1] - 1
+        cum_return = total_growth - 1.0
 
         summary_table[name] = {
             "Cumulative Return": f"{cum_return * 100:.2f}%",
@@ -132,19 +138,17 @@ def evaluate_metrics(results_df, df_returns):
 
     return pd.DataFrame(summary_table).T
 
+
 def plot_comparative_results(results_df):
-    """Generates a clean comparative plot charting equity curves on the left 
+    """Generates a clean comparative plot charting equity curves on the left
     and a highly faded green bar series for asset counts resting safely in the background.
     """
     fig, ax1 = plt.subplots(figsize=(12, 6))
 
-    # Calculate compounded wealth lines
     cum_turnover = (1 + results_df["Strategy_Turnover"]).cumprod() - 1
     cum_baseline = (1 + results_df["Strategy_Baseline"]).cumprod() - 1
     cum_benchmark = (1 + results_df["Benchmark"]).cumprod() - 1
 
-    # --- AXIS 1: LEFT SIDE (EQUITY TRAJECTORIES) ---
-    # High zorder ensures these lines are physically rendered on top of everything else
     ax1.plot(
         cum_turnover.index,
         cum_turnover * 100,
@@ -176,34 +180,29 @@ def plot_comparative_results(results_df):
     ax1.set_ylabel("Cumulative Return (%)", fontsize=11, fontweight="bold")
     ax1.grid(True, linestyle=":", alpha=0.5, zorder=0)
 
-    # --- AXIS 2: RIGHT SIDE (PERFECTLY FLAT FADED BACKGROUND SHAPE) ---
     ax2 = ax1.twinx()
-
-    # Using 'where=pre' or 'where=post' creates a clean, solid block structure 
-    # without overlapping daily artifacts
     ax2.fill_between(
         results_df.index,
         results_df["Active_Assets_Turnover"],
-        step="pre",       # Crucial: forces a clean geometric block layout
+        step="pre",
         color="#2ca02c",
-        alpha=0.06,       # Keeps it beautifully faded and soft
+        alpha=0.06,
         label="Turnover Strategy Asset Count",
-        zorder=1
+        zorder=1,
     )
 
     ax2.set_ylabel(
-        "Number of Active Tickers Held", fontsize=11, fontweight="bold", color="#2ca02c"
+        "Number of Active Tickers Held",
+        fontsize=11,
+        fontweight="bold",
+        color="#2ca02c",
     )
     ax2.tick_params(axis="y", labelcolor="#2ca02c")
-    
-    # Set rigid vertical limits for asset count so it looks balanced
     ax2.set_ylim(0, max(results_df["Active_Assets_Turnover"]) + 2)
 
-    # Ensure right axis doesn't draw lines over the left axis
     ax1.set_zorder(ax2.get_zorder() + 1)
     ax1.patch.set_visible(False)
 
-    # Cleanly integrate legends together
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", framealpha=0.9)
@@ -215,10 +214,9 @@ def plot_comparative_results(results_df):
         pad=15,
     )
     fig.tight_layout()
-
     plt.savefig("comprehensive_strategy_comparison.png", dpi=300)
-    print("\nVisual plot generated with a faded green background asset density block.")
     plt.show()
+
 
 if __name__ == "__main__":
     sp100_string = """
@@ -235,54 +233,58 @@ if __name__ == "__main__":
     """
     raw_tickers = sp100_string.split()
 
-    print("Downloading global multi-asset historical returns matrix (Asset-by-Asset mode)...")
-    
-    # 1. Download asset-by-asset to isolate timeline failures
+    print(
+        "Downloading global multi-asset historical returns matrix (Asset-by-Asset mode)..."
+    )
+
     downloaded_series = {}
     for ticker in raw_tickers:
         try:
-            df_single = yf.download(ticker, start="2015-01-01", end="2026-01-01", progress=False)
-            
-            # Extract closing price safely regardless of yfinance multi-index nesting
+            df_single = yf.download(
+                ticker, start="2015-01-01", end="2026-01-01", progress=False
+            )
+
             if isinstance(df_single.columns, pd.MultiIndex):
-                col = "Adj Close" if "Adj Close" in df_single.columns.levels[0] else "Close"
-                # Ensure we select only the 1D series for this ticker
+                col = (
+                    "Adj Close"
+                    if "Adj Close" in df_single.columns.levels[0]
+                    else "Close"
+                )
                 series = df_single[col][ticker]
             else:
                 col = "Adj Close" if "Adj Close" in df_single.columns else "Close"
                 series = df_single[col]
-                
-            # CRITICAL FIX: Force the series to be 1D and cleanly named
+
             if isinstance(series, pd.DataFrame):
-                series = series.iloc[:, 0] # Take the first column if multiple exist
-                
-            series = series.squeeze() # Squeeze any single-dimensional wrapper shapes
-            series.name = ticker      # Explicitly tag the column name
-            
+                series = series.iloc[:, 0]
+
+            series = series.squeeze()
+            series.name = ticker
+
             if not series.dropna().empty:
                 downloaded_series[ticker] = series
         except Exception:
-            print(f"Skipping {ticker}: Insufficient data footprint for this timeline.")
+            print(
+                f"Skipping {ticker}: Insufficient data footprint for this timeline."
+            )
 
-    # 2. Reconstruct dataframe from verified downloads
     df_raw = pd.DataFrame(downloaded_series)
-    
-    # 3. Handle assets with shorter histories gracefully
-    # Drop rows at the beginning where newer assets didn't exist yet, 
-    # or drop assets that are too young to give you a clean backtest matrix
-    cleaned_data = df_raw.dropna(axis=1, how="any")  # Keeps assets alive across the entire period
-    
+    cleaned_data = df_raw.dropna(axis=1, how="any")
+
     if cleaned_data.empty or cleaned_data.shape[1] < 3:
-        print("\n[Warning]: Dropna(how='any') left too few assets. Falling back to clearing younger assets...")
-        # Alternate strategy: Keep assets that have at least 80% data coverage over the 26-year horizon
+        print(
+            "\n[Warning]: Dropna(how='any') left too few assets. Falling back to clearing younger assets..."
+        )
         threshold = int(len(df_raw) * 0.8)
         df_filtered = df_raw.dropna(thresh=threshold, axis=1)
-        cleaned_data = df_filtered.fillna(method="ffill").dropna()
+        # FIXED: .fillna(method="ffill") replaced with modern .ffill() syntax
+        cleaned_data = df_filtered.ffill().dropna()
 
-    print(f"Data matrix stabilized. Simulating across {cleaned_data.shape[1]} long-history assets.")
+    print(
+        f"Data matrix stabilized. Simulating across {cleaned_data.shape[1]} long-history assets."
+    )
     daily_returns = cleaned_data.pct_change().dropna()
 
-    # --- Hyperparameters ---
     lambda_val = 0.1
     gamma_val = 0.03
     tau_val = 0.05
@@ -298,8 +300,12 @@ if __name__ == "__main__":
     )
 
     comparison_metrics = evaluate_metrics(results, daily_returns)
-    print("\n========================= PERFORMANCE SUMMARY TABLE =========================")
+    print(
+        "\n========================= PERFORMANCE SUMMARY TABLE ========================="
+    )
     print(comparison_metrics.to_string())
-    print("=============================================================================")
+    print(
+        "============================================================================="
+    )
 
     plot_comparative_results(results)

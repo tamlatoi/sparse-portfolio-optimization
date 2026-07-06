@@ -29,6 +29,9 @@ def robust_gerber_covariance_mad(returns, c=0.4):
     mad = np.median(np.abs(returns_matrix - med), axis=0)
     thresholds = c * mad
     
+    # Avoid zero division if MAD is perfectly flat
+    thresholds = np.where(thresholds < 1e-6, 1e-6, thresholds)
+    
     U = (returns_matrix >= thresholds).astype(float)
     D = (returns_matrix <= -thresholds).astype(float)
     
@@ -45,6 +48,7 @@ def robust_gerber_covariance_mad(returns, c=0.4):
     with np.errstate(divide='ignore', invalid='ignore'):
         G = np.where(denominator > 0, (N_CONC - N_DISC) / denominator, 0.0)
     np.fill_diagonal(G, 1.0)
+    G = np.clip(G, -1.0, 1.0)
     
     sample_std = np.std(returns_matrix, axis=0, ddof=1)
     gerber_cov = np.diag(sample_std) @ G @ np.diag(sample_std)
@@ -77,16 +81,23 @@ def nested_clustered_optimization(returns, base_cov):
     corr_matrix = cov_cleaned / np.outer(std_devs, std_devs)
     corr_matrix = np.clip(corr_matrix, -1.0, 1.0)
     
+    # Map correlation space into true Euclidean distance metric space
+    distance_matrix = np.sqrt(np.clip((1.0 - corr_matrix) / 2.0, 0.0, 1.0))
+    
     best_k, best_score = 2, -1.0
-    for k_test in range(2, min(8, N)):
-        km = KMeans(n_clusters=k_test, random_state=42, n_init=5)
-        labels = km.fit_predict(corr_matrix)
-        score = silhouette_score(corr_matrix, labels)
-        if score > best_score:
-            best_score, best_k = score, k_test
+    max_k = min(8, N - 1)
+    if max_k <= 2:
+        best_k = 2
+    else:
+        for k_test in range(2, max_k + 1):
+            km = KMeans(n_clusters=k_test, random_state=42, n_init=5)
+            labels = km.fit_predict(distance_matrix)
+            score = silhouette_score(distance_matrix, labels)
+            if score > best_score:
+                best_score, best_k = score, k_test
             
     clf = KMeans(n_clusters=best_k, random_state=42, n_init=5)
-    cluster_labels = clf.fit_predict(corr_matrix)
+    cluster_labels = clf.fit_predict(distance_matrix)
     
     w_intra = np.zeros((N, best_k))
     for k in range(best_k):
@@ -96,37 +107,46 @@ def nested_clustered_optimization(returns, base_cov):
         sub_cov = cov_cleaned[np.ix_(cluster_idx, cluster_idx)]
         w_sub = cp.Variable(len(cluster_idx))
         max_intra_w = max(0.15, 2.0 / len(cluster_idx))
-        prob = cp.Problem(cp.Minimize(cp.quad_form(w_sub, sub_cov)), [cp.sum(w_sub) == 1.0, w_sub >= 0.0, w_sub <= max_intra_w])
+        prob = cp.Problem(cp.Minimize(cp.quad_form(w_sub, cp.psd_wrap(sub_cov))), 
+                          [cp.sum(w_sub) == 1.0, w_sub >= 0.0, w_sub <= max_intra_w])
         prob.solve(solver=cp.CLARABEL)
-        w_intra[cluster_idx, k] = w_sub.value
+        w_intra[cluster_idx, k] = w_sub.value if w_sub.value is not None else 1.0 / len(cluster_idx)
         
     v_reduced = w_intra.T @ cov_cleaned @ w_intra
+    v_reduced = nearest_positive_definite(v_reduced)
+    
     w_inter = cp.Variable(best_k)
-    prob_inter = cp.Problem(cp.Minimize(cp.quad_form(w_inter, v_reduced)), [cp.sum(w_inter) == 1.0, w_inter >= 0.0])
+    prob_inter = cp.Problem(cp.Minimize(cp.quad_form(w_inter, cp.psd_wrap(v_reduced))), 
+                               [cp.sum(w_inter) == 1.0, w_inter >= 0.0])
     prob_inter.solve(solver=cp.CLARABEL)
     
-    return w_intra @ w_inter.value
+    inter_val = w_inter.value if w_inter.value is not None else np.ones(best_k) / best_k
+    return w_intra @ inter_val
 
 # ==============================================================================
-# 3. PURE TURNOVER CONSTRAINED CVAR OPTIMIZER
+# 3. BALANCED SCALED CVAR OPTIMIZER WITH NCO TRACKING
 # ==============================================================================
 
-def optimize_portfolio_cvar(historical_scenarios, cov_matrix, mu, w_initial, lamb=1.0, tau=0.01):
+def optimize_portfolio_cvar(historical_scenarios, cov_matrix, mu, w_initial, w_nco, lamb=1.0, tau=0.01):
     S, N = historical_scenarios.shape
     scenarios_matrix = np.asarray(historical_scenarios)
     
     cov_matrix = np.nan_to_num(cov_matrix)
     mu = np.nan_to_num(mu)
-    stabilized_cov = cov_matrix + np.eye(N) * 1e-6
+    stabilized_cov = cp.psd_wrap(cov_matrix + np.eye(N) * 1e-6)
     
-    # Calculate Dynamic CVaR baseline limits based on equal weight profile
+    # Re-scale inputs entirely to Annual Space to prevent numerical ill-conditioning
+    cov_annual = stabilized_cov * 252.0
+    mu_annual = mu
+    scenarios_annual = scenarios_matrix * np.sqrt(252.0)
+    
     eq_weights = np.ones(N) / N
-    equal_weight_scenarios = -scenarios_matrix @ eq_weights
+    equal_weight_scenarios = -scenarios_annual @ eq_weights
     base_95_cvar = np.percentile(equal_weight_scenarios, 95)
     base_99_cvar = np.percentile(equal_weight_scenarios, 99)
     
-    max_allowable_95_cvar = max(0.10, base_95_cvar * 0.95)
-    max_allowable_99_cvar = max(0.16, base_99_cvar * 0.95)
+    max_allowable_95_cvar = max(0.12, base_95_cvar * 0.98)
+    max_allowable_99_cvar = max(0.18, base_99_cvar * 0.98)
     
     w = cp.Variable(N)
     zeta_95 = cp.Variable()
@@ -134,39 +154,48 @@ def optimize_portfolio_cvar(historical_scenarios, cov_matrix, mu, w_initial, lam
     z_95 = cp.Variable(S)
     z_99 = cp.Variable(S)
     
-    mu_daily = mu / 252.0  
+    # Balanced Objective Terms
+    portfolio_risk = 0.5 * cp.quad_form(w, cov_annual)
+    scaled_return = lamb * (mu_annual @ w)
     
-    portfolio_risk = 0.5 * cp.quad_form(w, cp.psd_wrap(stabilized_cov))
-    scaled_return = lamb * (mu_daily @ w)
-    turnover_regularization = tau * cp.norm(w - w_initial, 1)
+    # MODIFIED: Dynamically switch penalty structure based on configuration profile
+    if w_initial is not None:
+        # Strategy 1: Dynamic Turnover Penalty Matrix
+        regularization = tau * cp.norm(w - w_initial, 1)
+    else:
+        # Strategy 2: Absolute ||w|| Standard Norm Penalty Strategy
+        regularization = tau * cp.norm(w, 1)
+        
+    # Combined Framework Optimization. We use NCO as a quadratic tracking anchor.
+    nco_tracking_penalty = 0.05 * cp.quad_form(w - w_nco, np.eye(N))
     
-    objective = cp.Minimize(portfolio_risk - scaled_return + turnover_regularization)
+    objective = cp.Minimize(portfolio_risk - scaled_return + regularization + nco_tracking_penalty)
     
     constraints = [
         cp.sum(w) == 1.0,
         w >= 0.0,
-        w <= 0.08, # Force core diversification profile across multi-collinear clusters
+        w <= 0.08, # Core diversification boundary condition across multi-collinear tokens
         
         z_95 >= 0.0,
-        (-scenarios_matrix @ w) - zeta_95 <= z_95,
+        (-scenarios_annual @ w) - zeta_95 <= z_95,
         zeta_95 + (1.0 / (1.0 - 0.95)) * cp.mean(z_95) <= max_allowable_95_cvar, 
         
         z_99 >= 0.0,
-        (-scenarios_matrix @ w) - zeta_99 <= z_99,
+        (-scenarios_annual @ w) - zeta_99 <= z_99,
         zeta_99 + (1.0 / (1.0 - 0.99)) * cp.mean(z_99) <= max_allowable_99_cvar
     ]
     
     prob = cp.Problem(objective, constraints)
     try:
-        prob.solve(solver=cp.CLARABEL, tol_gap_abs=1e-5, tol_gap_rel=1e-5)
+        prob.solve(solver=cp.CLARABEL, tol_gap_abs=1e-4, tol_gap_rel=1e-4)
     except Exception:
         try:
-            prob.solve(solver=cp.ECOS)
+            prob.solve(solver=cp.SCS, max_iters=2500)
         except Exception:
             pass
             
     if prob.status not in ["optimal", "optimal_inaccurate"] or w.value is None:
-        fallback_objective = cp.Minimize(portfolio_risk + turnover_regularization)
+        fallback_objective = cp.Minimize(portfolio_risk + regularization)
         prob_fallback = cp.Problem(fallback_objective, [cp.sum(w) == 1.0, w >= 0.0, w <= 0.08])
         prob_fallback.solve(solver=cp.CLARABEL)
         
@@ -179,25 +208,37 @@ def optimize_portfolio_cvar(historical_scenarios, cov_matrix, mu, w_initial, lam
 def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance_freq=21, lamb=1.0, tau=0.01):
     n_timesteps, n_assets = df_returns.shape
 
+    # Data Streams: Strategy 1 (Turnover Architecture)
     strat_robust_returns = []
-    strat_eq_returns = []          
     active_robust_count = []
-    w_current = np.ones(n_assets) / n_assets
-    backtest_dates = []
+    w_robust = np.ones(n_assets) / n_assets
 
-    active_scenarios = np.zeros((lookback_window, n_assets))
-    gerber_cov = np.eye(n_assets)
-    active_mu = np.zeros(n_assets)
+    # Data Streams: Strategy 2 (Absolute Norm Architecture)
+    strat_norm_returns = []
+    active_norm_count = []
+    w_norm = np.ones(n_assets) / n_assets
+
+    # Benchmarks
+    strat_eq_returns = []          
+    backtest_dates = []
 
     for t in range(lookback_window, n_timesteps):
         current_date = df_returns.index[t]
         daily_returns = df_returns.iloc[t].values
 
+        # --- 1. END-OF-DAY DRIFT ACCOUNTING ---
         if t > lookback_window:
-            w_current = w_current * (1.0 + df_returns.iloc[t-1].values)
-            sum_drift = np.sum(w_current)
-            w_current = w_current / sum_drift if sum_drift > 1e-5 else np.ones(n_assets) / n_assets
+            # Drift Strategy 1
+            w_robust = w_robust * (1.0 + df_returns.iloc[t-1].values)
+            sum_drift_r = np.sum(w_robust)
+            w_robust = w_robust / sum_drift_r if sum_drift_r > 1e-5 else np.ones(n_assets) / n_assets
+            
+            # Drift Strategy 2
+            w_norm = w_norm * (1.0 + df_returns.iloc[t-1].values)
+            sum_drift_n = np.sum(w_norm)
+            w_norm = w_norm / sum_drift_n if sum_drift_n > 1e-5 else np.ones(n_assets) / n_assets
 
+        # --- 2. PERIODIC REBALANCING ---
         if (t - lookback_window) % rebalance_freq == 0:
             window_data = df_returns.iloc[t - lookback_window:t]
             active_mask = (window_data.std() > 1e-7) & (~window_data.iloc[-1].isna())
@@ -208,44 +249,58 @@ def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance
                 active_scenarios = active_window_returns.values
                 
                 raw_gerber = robust_gerber_covariance_mad(active_window_returns, c=0.4)
-                w_nco = nested_clustered_optimization(active_window_returns, raw_gerber)
+                w_nco_active = nested_clustered_optimization(active_window_returns, raw_gerber)
                 
-                # FIXED: Calculate raw annualized mean expected return vector
-                active_mu = active_window_returns.mean().values * 252.0
+                # Exact Geometric Compounding
+                n_days = active_window_returns.shape[0]
+                terminal_wealth = (1.0 + active_window_returns).prod(axis=0)
+                terminal_wealth = np.maximum(1e-5, terminal_wealth.values)
+                active_mu = (terminal_wealth) ** (252.0 / n_days) - 1.0
+                
                 gerber_cov = de_noise_covariance(raw_gerber, active_scenarios.shape[0], active_scenarios.shape[1])
                 
+                # Setup localized weight representations
                 if t == lookback_window:
-                    w_initial_active = np.zeros(len(active_indices))
+                    w_init_active_r = np.zeros(len(active_indices))
                 else:
-                    w_initial_active = w_current[active_indices]
-                    if np.sum(w_initial_active) > 1e-5:
-                        w_initial_active = w_initial_active / np.sum(w_initial_active)
-                    else:
-                        w_initial_active = np.ones(len(active_indices)) / len(active_indices)
+                    w_init_active_r = w_robust[active_indices]
+                    w_init_active_r = w_init_active_r / np.sum(w_init_active_r) if np.sum(w_init_active_r) > 1e-5 else np.ones(len(active_indices)) / len(active_indices)
                 
+                # A. Run Optimization for Strategy 1 (Turnover Constraint: passes w_initial)
                 try:
-                    optimized_w_active = optimize_portfolio_cvar(
-                        historical_scenarios=active_scenarios,
-                        cov_matrix=gerber_cov,
-                        mu=active_mu,
-                        w_initial=w_initial_active,
-                        lamb=lamb,
-                        tau=tau
+                    opt_w_robust = optimize_portfolio_cvar(
+                        historical_scenarios=active_scenarios, cov_matrix=gerber_cov, mu=active_mu,
+                        w_initial=w_init_active_r, w_nco=w_nco_active, lamb=lamb, tau=tau
                     )
-                    
-                    if optimized_w_active is not None:
-                        optimized_w_active = np.array(optimized_w_active).flatten()
-                        optimized_w_active[np.abs(optimized_w_active) < 1e-3] = 0.0
-                        
-                        w_new_master = np.zeros(n_assets)
-                        w_new_master[active_indices] = optimized_w_active
-                        
-                        if np.sum(w_new_master) > 1e-4:
-                            w_current = w_new_master / np.sum(w_new_master)
+                    if opt_w_robust is not None:
+                        opt_w_robust = np.array(opt_w_robust).flatten()
+                        opt_w_robust[np.abs(opt_w_robust) < 1e-3] = 0.0
+                        w_new_m = np.zeros(n_assets)
+                        w_new_m[active_indices] = opt_w_robust
+                        if np.sum(w_new_m) > 1e-4:
+                            w_robust = w_new_m / np.sum(w_new_m)
                 except Exception:
                     pass
 
-        ret_robust = np.dot(w_current, daily_returns)
+                # B. Run Optimization for Strategy 2 (Absolute Norm Constraint: w_initial=None)
+                try:
+                    opt_w_norm = optimize_portfolio_cvar(
+                        historical_scenarios=active_scenarios, cov_matrix=gerber_cov, mu=active_mu,
+                        w_initial=None, w_nco=w_nco_active, lamb=lamb, tau=tau
+                    )
+                    if opt_w_norm is not None:
+                        opt_w_norm = np.array(opt_w_norm).flatten()
+                        opt_w_norm[np.abs(opt_w_norm) < 1e-3] = 0.0
+                        w_new_m = np.zeros(n_assets)
+                        w_new_m[active_indices] = opt_w_norm
+                        if np.sum(w_new_m) > 1e-4:
+                            w_norm = w_new_m / np.sum(w_new_m)
+                except Exception:
+                    pass
+
+        # --- 3. HARVEST SYSTEM RETURNS ---
+        ret_robust = np.dot(w_robust, daily_returns)
+        ret_norm = np.dot(w_norm, daily_returns)
         
         today_active_mask = ~df_returns.iloc[t].isna()
         w_eq = np.zeros(n_assets)
@@ -253,14 +308,19 @@ def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance
         ret_eq = np.dot(w_eq, daily_returns)
 
         strat_robust_returns.append(ret_robust)
+        strat_norm_returns.append(ret_norm)
         strat_eq_returns.append(ret_eq)
         backtest_dates.append(current_date)
-        active_robust_count.append(np.sum(w_current > 0.001))
+        
+        active_robust_count.append(np.sum(w_robust > 0.001))
+        active_norm_count.append(np.sum(w_norm > 0.001))
 
     results_df = pd.DataFrame({
         "Strategy_Robust": strat_robust_returns,
+        "Strategy_AbsoluteNorm": strat_norm_returns,
         "Strategy_EqualWeight": strat_eq_returns,
-        "Active_Assets_Robust": active_robust_count
+        "Active_Assets_Robust": active_robust_count,
+        "Active_Assets_AbsoluteNorm": active_norm_count
     }, index=backtest_dates)
 
     results_df["SP500"] = sp500_returns.loc[results_df.index]
@@ -271,7 +331,6 @@ def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance
 # ==============================================================================
 
 if __name__ == "__main__":
-    # CHOOSE YOUR FIXED TUNING VALUES HERE
     CHOSEN_LAMBDA = 0.1
     CHOSEN_TAU = 0.05
 
@@ -294,7 +353,7 @@ if __name__ == "__main__":
     LRCX FIS APD PH SNPS ZTS TT WELL KLAC ITW
     VRTX FTNT FDX COF LRCX HCA NVR CTAS APD AJG
     TT AON BMY TRV FICO EMR PGR MCO NOC GD
-    FCX MET MET NSC CEG GWW RMD NXPI TFC ORLY
+    FCX MET NSC CEG GWW RMD NXPI TFC ORLY
     SRE SPLK MCK CME FSLR STLD WM MAR AMP MPC
     GILD GIS LHX JCI NUE ADSK ADM WBD FICO AEE
     EOG PCG MSI COF CNC STT DXCM PSX CPS SNPS
@@ -324,7 +383,7 @@ if __name__ == "__main__":
     SMCI WHR ZION CPAY FLT GEV SOLV VFC XRAY VST
     PXD CRWD GDDY KKR CMA ILMN RHI SW WRK DELL
     ERIE TPL MRO APO LII WDAY DASH EXE TKO WSM
-    BWA CE FMC COIN DDOG JNPR TTD ANSS XYZ HES
+    BWA CE FMC COIN DDOG JNPR TTD ANSS HES
     PSKY IBKR WBA APP EME HOOD SOLS Q EMN FISV
     """
     
@@ -342,15 +401,18 @@ if __name__ == "__main__":
     valid_stock_series = {}
     for i in range(0, len(raw_tickers), chunk_size):
         chunk = raw_tickers[i:i + chunk_size]
-        df_chunk_raw = yf.download(chunk, start="2016-01-01", end="2026-01-01", auto_adjust=True, progress=False, session=scraper_session)
-        if isinstance(df_chunk_raw.columns, pd.MultiIndex):
-            df_close = df_chunk_raw.xs('Close', axis=1, level=0)
-        else:
-            df_close = df_chunk_raw['Close'] if 'Close' in df_chunk_raw.columns else df_chunk_raw
-            
-        for ticker in chunk:
-            if ticker in df_close.columns:
-                valid_stock_series[ticker] = df_close[ticker].squeeze()
+        try:
+            df_chunk_raw = yf.download(chunk, start="2016-01-01", end="2026-01-01", auto_adjust=True, progress=False, session=scraper_session)
+            if isinstance(df_chunk_raw.columns, pd.MultiIndex):
+                df_close = df_chunk_raw.xs('Close', axis=1, level=0)
+            else:
+                df_close = df_chunk_raw['Close'] if 'Close' in df_chunk_raw.columns else df_chunk_raw
+                
+            for ticker in chunk:
+                if ticker in df_close.columns:
+                    valid_stock_series[ticker] = df_close[ticker].squeeze()
+        except Exception as e:
+            print(f"Skipping chunk due to structural response anomaly: {e}")
 
     df_stocks = pd.DataFrame(valid_stock_series)
 
@@ -358,15 +420,15 @@ if __name__ == "__main__":
     df_stocks = df_stocks.loc[common_idx]
     sp500_series = sp500_series.loc[common_idx]
 
-    # FIXED: Handled deprecation warning via explicitly declaring fill_method=None
     stock_returns = df_stocks.ffill().pct_change(fill_method=None).fillna(0.0)
     sp500_returns = sp500_series.pct_change().dropna()
 
-    print(f"\nRunning target profile using Lambda={CHOSEN_LAMBDA}, Tau={CHOSEN_TAU}...")
+    print(f"\nRunning matrix simulations using Lambda={CHOSEN_LAMBDA}, Tau={CHOSEN_TAU}...")
     res = run_sp500_backtest(stock_returns, sp500_returns, lamb=CHOSEN_LAMBDA, tau=CHOSEN_TAU)
 
-    # Calculate Cumulative Compounded Growth Matrices
+    # Calculate equity curves
     cum_robust = (1 + res["Strategy_Robust"]).cumprod() - 1
+    cum_norm = (1 + res["Strategy_AbsoluteNorm"]).cumprod() - 1
     cum_eq = (1 + res["Strategy_EqualWeight"]).cumprod() - 1
     cum_sp500 = (1 + res["SP500"]).cumprod() - 1
 
@@ -377,22 +439,17 @@ if __name__ == "__main__":
     def print_performance_metrics(returns_df):
         metrics = {}
         trading_days = 252
+        target_columns = ["Strategy_Robust", "Strategy_AbsoluteNorm", "Strategy_EqualWeight", "SP500"]
         
-        for column in ["Strategy_Robust", "Strategy_EqualWeight", "SP500"]:
+        for column in target_columns:
             rets = returns_df[column].values
             
-            # Annualized Return (Geometric Compounding)
             total_ret = (1 + rets).prod()
             n_days = len(rets)
             ann_return = (total_ret) ** (trading_days / n_days) - 1
-            
-            # Annualized Volatility
             ann_vol = np.std(rets, ddof=1) * np.sqrt(trading_days)
-            
-            # Sharpe Ratio (Assuming 0% Risk-Free Rate)
             sharpe = ann_return / ann_vol if ann_vol > 0 else 0
             
-            # Maximum Drawdown tracking array
             cum_rets = (1 + rets).cumprod()
             running_max = np.maximum.accumulate(cum_rets)
             running_max = np.where(running_max == 0, 1.0, running_max)
@@ -408,40 +465,40 @@ if __name__ == "__main__":
             }
             
         summary_df = pd.DataFrame(metrics).round(2)
-        print("\n" + "="*60)
-        print("          BACKTEST PERFORMANCE PORTFOLIO METRICS")
-        print("="*60)
+        print("\n" + "="*75)
+        print("                 COMPREHENSIVE BACKTEST PERFORMANCE METRICS")
+        print("="*75)
         print(summary_df.to_string())
-        print("="*60 + "\n")
+        print("="*75 + "\n")
         return summary_df
 
-    # Execute metrics print calculation out to terminal
     summary_metrics = print_performance_metrics(res)
 
     # ==============================================================================
-    # 7. GENERATE DUAL-AXIS PERFORMANCE PLOT
+    # 7. GENERATE MULTI-STRATEGY PERFORMANCE PLOT
     # ==============================================================================
     fig, ax1 = plt.subplots(figsize=(14, 7))
 
-    # Left Axis: Cumulative Performance (Percentages)
-    ax1.plot(res.index, cum_robust * 100, label="Robust Paper Portfolio", color="#1f77b4", linewidth=2.5)
-    ax1.plot(res.index, cum_eq * 100, label="Equal-Weighted 1/N Portfolio", color="grey", linestyle="-.", alpha=0.8)
-    ax1.plot(res.index, cum_sp500 * 100, label="S&P 500 Index Market (^GSPC)", color="black", linestyle="--", linewidth=2)
+    ax1.plot(res.index, cum_robust * 100, label="Turnover Constrained Matrix (||w - w_drift||)", color="#1f77b4", linewidth=2.5)
+    ax1.plot(res.index, cum_norm * 100, label="Absolute Regularized Baseline (||w||)", color="#d62728", linestyle=":", linewidth=2.2)
+    ax1.plot(res.index, cum_eq * 100, label="Equal-Weighted 1/N Portfolio", color="grey", linestyle="-.", alpha=0.7)
+    ax1.plot(res.index, cum_sp500 * 100, label="S&P 500 Index Market (^GSPC)", color="black", linestyle="--", linewidth=1.5)
+    
     ax1.set_xlabel("Historical Timeline", fontsize=11, fontweight="bold")
     ax1.set_ylabel("Cumulative Performance Return (%)", fontsize=11, fontweight="bold")
     ax1.grid(True, linestyle=":", alpha=0.6)
     ax1.legend(loc="upper left")
 
-    # Right Axis: Active Breadth Count Profile
+    # Background Sparsity Comparison
     ax2 = ax1.twinx()
-    ax2.fill_between(res.index, res["Active_Assets_Robust"], color="green", alpha=0.04, label="Robust Sparsity Selection Profile")
-    ax2.set_ylabel("Number of Active Assets Selected", color="green", fontsize=11, fontweight="bold")
-    ax2.tick_params(axis='y', labelcolor="green")
+    ax2.plot(res.index, res["Active_Assets_Robust"], color="#1f77b4", alpha=0.25, linestyle="-", label="Sparsity: w_drift")
+    ax2.plot(res.index, res["Active_Assets_AbsoluteNorm"], color="#d62728", alpha=0.25, linestyle="--", label="Sparsity: Absolute Norm")
+    ax2.set_ylabel("Number of Active Assets Selected", color="darkgreen", fontsize=11, fontweight="bold")
+    ax2.tick_params(axis='y', labelcolor="darkgreen")
 
-    plt.title(f"Integrated Strategy Vector Performance vs S&P 500 Benchmark Universe (Lambda={CHOSEN_LAMBDA}, Tau={CHOSEN_TAU})", fontsize=12, fontweight="bold", pad=15)
+    plt.title(f"Fully Cleaned Unified Architecture Performance Engine (Lambda={CHOSEN_LAMBDA}, Tau={CHOSEN_TAU})", fontsize=12, fontweight="bold", pad=15)
     plt.tight_layout()
     
-    # Save chart locally
     plt.savefig("integrated_strategy_performance.png", dpi=300)
     print("Simulation complete. Performance graph saved to integrated_strategy_performance.png")
     plt.show()
