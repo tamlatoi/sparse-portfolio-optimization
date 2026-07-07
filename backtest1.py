@@ -46,16 +46,22 @@ def robust_gerber_covariance_mad(returns, c=0.5):
         G = np.where(denominator > 0, (N_CONC - N_DISC) / denominator, 0.0)
     np.fill_diagonal(G, 1.0)
     
+    # FIX: Make the core relation matrix G positive definite BEFORE variance scaling
+    G_cleaned = nearest_positive_definite(G, eps=1e-4)
+    
     sample_std = np.std(returns_matrix, axis=0, ddof=1)
-    gerber_cov = np.diag(sample_std) @ G @ np.diag(sample_std)
-    return nearest_positive_definite(gerber_cov)
+    gerber_cov = np.diag(sample_std) @ G_cleaned @ np.diag(sample_std)
+    return gerber_cov
 
 
 def de_noise_covariance(cov_matrix, T, N):
     """Marchenko-Pastur De-noising Framework tuned for high-dimensions."""
     eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
     sigma_sq = np.mean(eigenvalues[eigenvalues > 1e-5]) if np.any(eigenvalues > 1e-5) else 1.0
-    lambda_plus = sigma_sq * (1.0 + np.sqrt(N / T)) ** 2
+    
+    # FIX: Guarding Marchenko-Pastur when N > T
+    aspect_ratio = min(N / T, 1.0)
+    lambda_plus = sigma_sq * (1.0 + np.sqrt(aspect_ratio)) ** 2
     
     is_noise = eigenvalues <= lambda_plus
     if np.any(is_noise):
@@ -69,49 +75,52 @@ def de_noise_covariance(cov_matrix, T, N):
 # 2. HIGH-DIMENSIONAL CVAR PORTFOLIO OPTIMIZER 
 # ==============================================================================
 
-def optimize_portfolio_hd_cvar(historical_scenarios, cov_matrix, mu, w_initial=None, lamb=0.15, tau=0.02):
+def optimize_portfolio_hd_cvar(historical_scenarios, cov_matrix, mu, w_initial=None, lamb=1.0, tau=0.02, use_cvar=True):
     """Convex Portfolio Optimizer scaling CVaR with dynamic turnover constraints."""
     S, N = historical_scenarios.shape
     scenarios_matrix = np.asarray(historical_scenarios)
     stabilized_cov = nearest_positive_definite(cov_matrix, eps=1e-5)
     
     w = cp.Variable(N)
-    zeta_95 = cp.Variable()
-    zeta_99 = cp.Variable()
-    z_95 = cp.Variable(S)
-    z_99 = cp.Variable(S)
     
-    mu_daily = mu / 252.0  
+    # FIX: Both risk metrics and returns are now properly annualized inside the objective function
+    portfolio_risk = 0.5 * cp.quad_form(w, cp.psd_wrap(stabilized_cov * 252))
+    scaled_return = lamb * (mu @ w)
     
-    portfolio_risk = 0.5 * cp.quad_form(w, cp.psd_wrap(stabilized_cov))
-    scaled_return = lamb * (mu_daily @ w)
-    
-    # Target Objective Formulations
-    if w_initial is not None:
+    # FIX: Explicitly ignore turnover regularizers if the portfolio is starting from scratch (weights all 0)
+    if w_initial is not None and np.sum(w_initial) > 1e-5:
         norm_regularization = tau * cp.norm(w - w_initial, 1)
         objective = cp.Minimize(portfolio_risk - scaled_return + norm_regularization)
     else:
         objective = cp.Minimize(portfolio_risk - scaled_return)
         
-    # Dynamically extract realistic upper CVaR limits from the scenario history to prevent execution failure
-    eq_losses = -scenarios_matrix @ (np.ones(N) / N)
-    var_95_est = np.percentile(eq_losses, 95)
-    var_99_est = np.percentile(eq_losses, 99)
-    cvar_95_limit = max(0.045, np.mean(eq_losses[eq_losses >= var_95_est]))
-    cvar_99_limit = max(0.060, np.mean(eq_losses[eq_losses >= var_99_est]))
-
     constraints = [
         cp.sum(w) == 1.0,
-        w >= 0.0, 
-        
-        z_95 >= 0.0,
-        (-scenarios_matrix @ w) - zeta_95 <= z_95,
-        zeta_95 + (1.0 / (1.0 - 0.95)) * cp.mean(z_95) <= cvar_95_limit, 
-        
-        z_99 >= 0.0,
-        (-scenarios_matrix @ w) - zeta_99 <= z_99,
-        zeta_99 + (1.0 / (1.0 - 0.99)) * cp.mean(z_99) <= cvar_99_limit  
+        w >= 0.0
     ]
+
+    # FIX: Conditional CVaR Block (Allows true baseline separation for Strategy 2 Markowitz)
+    if use_cvar:
+        zeta_95 = cp.Variable()
+        zeta_99 = cp.Variable()
+        z_95 = cp.Variable(S)
+        z_99 = cp.Variable(S)
+        
+        eq_losses = -scenarios_matrix @ (np.ones(N) / N)
+        var_95_est = np.percentile(eq_losses, 95)
+        var_99_est = np.percentile(eq_losses, 99)
+        cvar_95_limit = max(0.015, np.mean(eq_losses[eq_losses >= var_95_est]))
+        cvar_99_limit = max(0.025, np.mean(eq_losses[eq_losses >= var_99_est]))
+        
+        constraints += [
+            z_95 >= 0.0,
+            (-scenarios_matrix @ w) - zeta_95 <= z_95,
+            zeta_95 + (1.0 / (1.0 - 0.95)) * cp.mean(z_95) <= cvar_95_limit, 
+            
+            z_99 >= 0.0,
+            (-scenarios_matrix @ w) - zeta_99 <= z_99,
+            zeta_99 + (1.0 / (1.0 - 0.99)) * cp.mean(z_99) <= cvar_99_limit  
+        ]
     
     for solver_candidate, opts in [(cp.CLARABEL, {'tol_gap_abs': 1e-4, 'tol_gap_rel': 1e-4}), (cp.SCS, {'max_iters': 2500})]:
         try:
@@ -122,7 +131,6 @@ def optimize_portfolio_hd_cvar(historical_scenarios, cov_matrix, mu, w_initial=N
         except Exception:
             continue
         
-    # Consistent fallback configuration matching optimization bounds (No arbitrary max allocation capping)
     fallback_obj = cp.Minimize(portfolio_risk)
     prob_fallback = cp.Problem(fallback_obj, [cp.sum(w) == 1.0, w >= 0.0])
     try:
@@ -138,7 +146,7 @@ def optimize_portfolio_hd_cvar(historical_scenarios, cov_matrix, mu, w_initial=N
 # 3. BACKTEST SIMULATION ENGINE
 # ==============================================================================
 
-def run_hd_backtest(df_returns, benchmark_returns, lookback_window=252, rebalance_freq=21, lamb=0.15, tau=0.02):
+def run_hd_backtest(df_returns, benchmark_returns, lookback_window=252, rebalance_freq=21, lamb=1.0, tau=0.02):
     """Simulates performance vectors over scrolling lookback windows."""
     n_timesteps, n_assets = df_returns.shape
     
@@ -151,8 +159,9 @@ def run_hd_backtest(df_returns, benchmark_returns, lookback_window=252, rebalanc
     active_robust_counts = []
     active_markowitz_counts = []
     
-    w_robust = np.ones(n_assets) / n_assets
-    w_markowitz = np.ones(n_assets) / n_assets
+    # FIX: Initialize all tracking weights to absolute zero as requested
+    w_robust = np.zeros(n_assets)
+    w_markowitz = np.zeros(n_assets)
 
     for t in range(lookback_window, n_timesteps):
         current_date = df_returns.index[t]
@@ -162,11 +171,14 @@ def run_hd_backtest(df_returns, benchmark_returns, lookback_window=252, rebalanc
         if t > lookback_window:
             prev_day_returns = df_returns.iloc[t-1].values
             
-            w_robust = w_robust * (1.0 + prev_day_returns)
-            w_robust = w_robust / w_robust.sum() if w_robust.sum() > 1e-5 else np.ones(n_assets) / n_assets
+            # Guard against drift operations if it is still empty (Pre-Rebalance)
+            if w_robust.sum() > 1e-5:
+                w_robust = w_robust * (1.0 + prev_day_returns)
+                w_robust = w_robust / w_robust.sum()
             
-            w_markowitz = w_markowitz * (1.0 + prev_day_returns)
-            w_markowitz = w_markowitz / w_markowitz.sum() if w_markowitz.sum() > 1e-5 else np.ones(n_assets) / n_assets
+            if w_markowitz.sum() > 1e-5:
+                w_markowitz = w_markowitz * (1.0 + prev_day_returns)
+                w_markowitz = w_markowitz / w_markowitz.sum()
 
         # --- Rebalancing Matrix Intersections ---
         if (t - lookback_window) % rebalance_freq == 0:
@@ -176,35 +188,41 @@ def run_hd_backtest(df_returns, benchmark_returns, lookback_window=252, rebalanc
             raw_gerber = robust_gerber_covariance_mad(window_returns, c=0.5)
             cleaned_cov = de_noise_covariance(raw_gerber, scenarios.shape[0], scenarios.shape[1])
             
-            # Use safe geometric mean calculation annualized properly without arithmetic distortions
-            mu_ann = (np.exp(np.log(1 + window_returns).mean(axis=0)) ** 252 - 1).values
+            # FIX: Swapped out log formulas for proper linear annualized arithmetic returns
+            mu_ann = window_returns.mean(axis=0).values * 252
             
             # Strategy 1: Robust Turnover Constrained
             try:
                 w_opt_r = optimize_portfolio_hd_cvar(
                     historical_scenarios=scenarios, cov_matrix=cleaned_cov, mu=mu_ann,
-                    w_initial=w_robust, lamb=lamb, tau=tau
+                    w_initial=w_robust, lamb=lamb, tau=tau, use_cvar=True
                 )
                 w_robust = np.array(w_opt_r).flatten()
                 w_robust[w_robust < 1e-3] = 0.0
                 w_robust /= w_robust.sum()
             except Exception:
-                pass
+                if w_robust.sum() < 1e-5: # Fallback configuration if day 1 optimization fails
+                    w_robust = np.ones(n_assets) / n_assets
 
-            # Strategy 2: Pure Classical Markowitz (No Regularization)
+            # Strategy 2: Pure Classical Markowitz (FIX: Removed CVaR Constraint Layer)
             try:
                 w_opt_m = optimize_portfolio_hd_cvar(
                     historical_scenarios=scenarios, cov_matrix=cleaned_cov, mu=mu_ann,
-                    w_initial=None, lamb=lamb, tau=tau
+                    w_initial=None, lamb=lamb, tau=tau, use_cvar=False
                 )
                 w_markowitz = np.array(w_opt_m).flatten()
                 w_markowitz[w_markowitz < 1e-3] = 0.0
                 w_markowitz /= w_markowitz.sum()
             except Exception:
-                pass
+                if w_markowitz.sum() < 1e-5:
+                    w_markowitz = np.ones(n_assets) / n_assets
 
-        strat_robust_returns.append(np.dot(w_robust, daily_returns))
-        strat_markowitz_returns.append(np.dot(w_markowitz, daily_returns))
+        # Handle early tracking if rebalance has not generated allocations yet
+        rec_robust = np.dot(w_robust, daily_returns) if w_robust.sum() > 1e-5 else 0.0
+        rec_markowitz = np.dot(w_markowitz, daily_returns) if w_markowitz.sum() > 1e-5 else 0.0
+
+        strat_robust_returns.append(rec_robust)
+        strat_markowitz_returns.append(rec_markowitz)
         strat_eq_returns.append(df_returns.iloc[t].mean())
         strat_spy_returns.append(benchmark_returns.loc[current_date])
         
@@ -230,8 +248,8 @@ def run_hd_backtest(df_returns, benchmark_returns, lookback_window=252, rebalanc
 if __name__ == "__main__":
     START_DATE = "2016-01-01" 
     END_DATE = "2026-01-01"
-    CHOSEN_LAMBDA = 1.0      
-    CHOSEN_TAU = 0.2         
+    CHOSEN_LAMBDA = 0.1  # Balanced perfectly now due to covariance matrix annualization fixes
+    CHOSEN_TAU = 0.005    # Scaled down to realistically allow execution away from starting coordinates
 
     ticker_string = '''
         SPY QQQ DIA IWM VTI VO IVV IJH IJR
@@ -302,8 +320,8 @@ if __name__ == "__main__":
 
     # Visualization Generation Pipeline
     fig, ax1 = plt.subplots(figsize=(14, 7))
-    ax1.plot(res.index, (1 + res["Strategy_Robust"]).cumprod() - 1, label="Strategy 1: Robust Turnover Constrained (||w - w_drift||)", color="#1f77b4", linewidth=2.5)
-    ax1.plot(res.index, (1 + res["Strategy_Markowitz"]).cumprod() - 1, label="Strategy 2: Classic Markowitz Framework (Risk-Return Only)", color="#d62728", linestyle=":", linewidth=2.2)
+    ax1.plot(res.index, (1 + res["Strategy_Robust"]).cumprod() - 1, label="Strategy 1: Robust Turnover Constrained", color="#1f77b4", linewidth=2.5)
+    ax1.plot(res.index, (1 + res["Strategy_Markowitz"]).cumprod() - 1, label="Strategy 2: True Classic Markowitz Baseline", color="#d62728", linestyle=":", linewidth=2.2)
     ax1.plot(res.index, (1 + res["Strategy_EqualWeight"]).cumprod() - 1, label="Strategy 3: Equal-Weighted 1/N Portfolio", color="grey", linestyle="-.", alpha=0.7)
     ax1.plot(res.index, (1 + res["Benchmark_SPY"]).cumprod() - 1, label="Strategy 4: S&P 500 Index Benchmark (SPY)", color="black", linestyle="--", linewidth=1.5)
     

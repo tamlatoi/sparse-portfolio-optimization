@@ -57,6 +57,9 @@ def robust_gerber_covariance_mad(returns_matrix, c=0.4):
 
 def de_noise_covariance(cov_matrix, T, N):
     """Cleans noise from the covariance matrix via Marchenko-Pastur properties."""
+    # Ensure raw input is strictly symmetric positive definite first
+    cov_matrix = nearest_positive_definite(cov_matrix)
+    
     eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
     sigma_sq = np.mean(eigenvalues)
     lambda_plus = sigma_sq * (1.0 + np.sqrt(N / T)) ** 2
@@ -69,19 +72,19 @@ def de_noise_covariance(cov_matrix, T, N):
     return nearest_positive_definite(de_noised_cov)
 
 # ==============================================================================
-# 2. BALANCED SCALED CVAR OPTIMIZER
+# 2. BALANCED SCALED CVAR OPTIMIZER (STRICT DAILY MATHEMATICS)
 # ==============================================================================
 
-def optimize_portfolio_cvar(scenarios_annual, cov_annual, mu_annual, w_initial=None, tau=0.01):
-    """Performs portfolio optimization under parametric constraints & tail-risk (CVaR) boundaries."""
-    S, N = scenarios_annual.shape
+def optimize_portfolio_cvar(scenarios_daily, cov_daily, mu_daily, w_initial=None, tau=0.01):
+    """Performs portfolio optimization under daily parametric constraints & tail-risk boundaries."""
+    S, N = scenarios_daily.shape
     
     eq_weights = np.ones(N) / N
-    equal_weight_scenarios = -scenarios_annual @ eq_weights
+    equal_weight_scenarios = -scenarios_daily @ eq_weights
     
-    # Adaptive upper bound tail constraint configurations
-    max_allowable_95_cvar = max(0.15, np.percentile(equal_weight_scenarios, 95) * 0.98)
-    max_allowable_99_cvar = max(0.22, np.percentile(equal_weight_scenarios, 99) * 0.98)
+    # Corrected Scale: Adaptive daily tail constraint configurations (e.g. 1.5% to 2.5% tail shocks)
+    max_allowable_95_cvar = max(0.015, np.percentile(equal_weight_scenarios, 95) * 1.15)
+    max_allowable_99_cvar = max(0.025, np.percentile(equal_weight_scenarios, 99) * 1.15)
     
     w = cp.Variable(N)
     zeta_95 = cp.Variable()
@@ -89,15 +92,15 @@ def optimize_portfolio_cvar(scenarios_annual, cov_annual, mu_annual, w_initial=N
     z_95 = cp.Variable(S)
     z_99 = cp.Variable(S)
     
-    portfolio_risk = 0.5 * cp.quad_form(w, cov_annual)
-    scaled_return = mu_annual @ w
+    portfolio_risk = 0.5 * cp.quad_form(w, cov_daily)
+    # Annualized return target scaled appropriately to balance quadratic daily risk
+    scaled_return = (mu_daily * 252.0) @ w 
     
-    # Structural target formulation branching
     if w_initial is not None:
-        # Strategy 1: Active turnover minimization platform
+        # Strategy 1: Active turnover minimization tracking
         objective = cp.Minimize(portfolio_risk - scaled_return + (tau * cp.norm(w - w_initial, 1)))
     else:
-        # Strategy 2: Pure Classic Markowitz (Risk-Return Optimization)
+        # Strategy 2: Pure Classic Markowitz Risk-Return Optimization
         objective = cp.Minimize(portfolio_risk - scaled_return)
         
     constraints = [
@@ -105,11 +108,11 @@ def optimize_portfolio_cvar(scenarios_annual, cov_annual, mu_annual, w_initial=N
         w >= 0.0, 
         
         z_95 >= 0.0,
-        (-scenarios_annual @ w) - zeta_95 <= z_95,
+        (-scenarios_daily @ w) - zeta_95 <= z_95,
         zeta_95 + (1.0 / (1.0 - 0.95)) * cp.mean(z_95) <= max_allowable_95_cvar, 
         
         z_99 >= 0.0,
-        (-scenarios_annual @ w) - zeta_99 <= z_99,
+        (-scenarios_daily @ w) - zeta_99 <= z_99,
         zeta_99 + (1.0 / (1.0 - 0.99)) * cp.mean(z_99) <= max_allowable_99_cvar
     ]
     
@@ -123,9 +126,13 @@ def optimize_portfolio_cvar(scenarios_annual, cov_annual, mu_annual, w_initial=N
             pass
             
     if prob.status not in ["optimal", "optimal_inaccurate"] or w.value is None:
-        fallback_objective = cp.Minimize(portfolio_risk)
-        prob_fallback = cp.Problem(fallback_objective, [cp.sum(w) == 1.0, w >= 0.0, w <= 0.08])
+        # Dynamic Fallback: Avoid hardcoded 0.08 if it creates an infeasible program
+        w_fallback = cp.Variable(N)
+        upper_bound = max(0.08, (1.0 / N) + 0.02)
+        fallback_objective = cp.Minimize(0.5 * cp.quad_form(w_fallback, cov_daily))
+        prob_fallback = cp.Problem(fallback_objective, [cp.sum(w_fallback) == 1.0, w_fallback >= 0.0, w_fallback <= upper_bound])
         prob_fallback.solve(solver=cp.CLARABEL)
+        return w_fallback.value
         
     return w.value
 
@@ -137,10 +144,11 @@ def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance
     n_timesteps, n_assets = df_returns.shape
 
     strat_robust_returns, active_robust_count = [], []
-    w_robust = np.ones(n_assets) / n_assets
+    # FIX: Initialize weights strictly to all zeros
+    w_robust = np.zeros(n_assets)
 
     strat_markowitz_returns, active_markowitz_count = [], []
-    w_markowitz = np.ones(n_assets) / n_assets
+    w_markowitz = np.zeros(n_assets)
 
     strat_eq_returns, backtest_dates = [], []
 
@@ -149,19 +157,20 @@ def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance
         daily_returns = df_returns.iloc[t].values
 
         # --- 1. END-OF-DAY DRIFT ACCOUNTING ---
-        # Account for asset price movements from yesterday to today before any new rebalancing executes
         if t > lookback_window:
             prev_returns = df_returns.iloc[t-1].values
             
-            w_robust = w_robust * (1.0 + prev_returns)
-            w_robust = w_robust / np.sum(w_robust) if np.sum(w_robust) > 1e-5 else np.ones(n_assets) / n_assets
-            
-            w_markowitz = w_markowitz * (1.0 + prev_returns)
-            w_markowitz = w_markowitz / np.sum(w_markowitz) if np.sum(w_markowitz) > 1e-5 else np.ones(n_assets) / n_assets
+            # Drift tracking applies if a nonzero asset portfolio exists
+            if np.sum(w_robust) > 1e-5:
+                w_robust = w_robust * (1.0 + prev_returns)
+                w_robust = w_robust / np.sum(w_robust)
+                
+            if np.sum(w_markowitz) > 1e-5:
+                w_markowitz = w_markowitz * (1.0 + prev_returns)
+                w_markowitz = w_markowitz / np.sum(w_markowitz)
 
-        # --- 2. PERIODIC REBALANCING (EXECUTED AT START OF DAY t BASED ON INFORMATION UP TO t-1) ---
+        # --- 2. PERIODIC REBALANCING ---
         if (t - lookback_window) % rebalance_freq == 0:
-            # Exclude day t to guarantee no look-ahead data leakage
             window_data = df_returns.iloc[t - lookback_window:t]
             active_mask = (window_data.std() > 1e-7) & (~window_data.iloc[-1].isna())
             active_indices = np.where(active_mask)[0]
@@ -169,24 +178,23 @@ def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance
             if len(active_indices) > 20:  
                 active_scenarios = window_data.iloc[:, active_indices].values
                 
-                # Execution Matrix Pipeline (Single-pass NPD conversion)
                 raw_gerber = robust_gerber_covariance_mad(active_scenarios, c=0.4)
-                gerber_cov = de_noise_covariance(raw_gerber, active_scenarios.shape[0], active_scenarios.shape[1])
+                cov_daily = de_noise_covariance(raw_gerber, active_scenarios.shape[0], active_scenarios.shape[1])
+                cov_daily = cp.psd_wrap(cov_daily + np.eye(len(active_indices)) * 1e-6)
                 
-                # Annualization scaling step (Linear scaling for CVaR returns matrices)
-                cov_annual = cp.psd_wrap(gerber_cov + np.eye(len(active_indices)) * 1e-6) * 252.0
-                mu_annual = active_scenarios.mean(axis=0) * 252.0 * lamb
-                scenarios_annual = active_scenarios * 252.0
+                mu_daily = active_scenarios.mean(axis=0) * lamb
                 
-                if t == lookback_window:
-                    w_init_active_r = np.zeros(len(active_indices))
+                # Setup prior allocation target vector
+                w_init_active_r = w_robust[active_indices]
+                if np.sum(w_init_active_r) > 1e-5:
+                    w_init_active_r = w_init_active_r / np.sum(w_init_active_r)
                 else:
-                    w_init_active_r = w_robust[active_indices]
-                    w_init_active_r = w_init_active_r / np.sum(w_init_active_r) if np.sum(w_init_active_r) > 1e-5 else np.ones(len(active_indices)) / len(active_indices)
+                    # Stays zeros on day 1 if initialized as zero
+                    w_init_active_r = np.zeros(len(active_indices))
                 
-                # A. Strategy 1: Optimization Execution (Turnover Constraint Platform)
+                # A. Strategy 1: Robust Matrix Optimization
                 try:
-                    opt_w_robust = optimize_portfolio_cvar(scenarios_annual, cov_annual, mu_annual, w_initial=w_init_active_r, tau=tau)
+                    opt_w_robust = optimize_portfolio_cvar(active_scenarios, cov_daily, mu_daily, w_initial=w_init_active_r, tau=tau)
                     if opt_w_robust is not None:
                         opt_w_robust = np.array(opt_w_robust).flatten()
                         opt_w_robust[np.abs(opt_w_robust) < 1e-3] = 0.0
@@ -194,12 +202,12 @@ def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance
                         w_new_robust[active_indices] = opt_w_robust
                         if np.sum(w_new_robust) > 1e-4:
                             w_robust = w_new_robust / np.sum(w_new_robust)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"Optimization system warning (Robust) at step {t}: {e}")
 
-                # B. Strategy 2: Optimization Execution (Pure Classic Markowitz)
+                # B. Strategy 2: Pure Classic Markowitz Optimization
                 try:
-                    opt_w_markowitz = optimize_portfolio_cvar(scenarios_annual, cov_annual, mu_annual, w_initial=None)
+                    opt_w_markowitz = optimize_portfolio_cvar(active_scenarios, cov_daily, mu_daily, w_initial=None)
                     if opt_w_markowitz is not None:
                         opt_w_markowitz = np.array(opt_w_markowitz).flatten()
                         opt_w_markowitz[np.abs(opt_w_markowitz) < 1e-3] = 0.0
@@ -207,8 +215,8 @@ def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance
                         w_new_markowitz[active_indices] = opt_w_markowitz
                         if np.sum(w_new_markowitz) > 1e-4:
                             w_markowitz = w_new_markowitz / np.sum(w_new_markowitz)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"Optimization system warning (Markowitz) at step {t}: {e}")
 
         # --- 3. HARVEST SYSTEM RETURNS ---
         strat_robust_returns.append(np.dot(w_robust, daily_returns))
@@ -239,7 +247,7 @@ def run_sp500_backtest(df_returns, sp500_returns, lookback_window=252, rebalance
 # ==============================================================================
 
 if __name__ == "__main__":
-    CHOSEN_LAMBDA, CHOSEN_TAU = 0.1, 0.05
+    CHOSEN_LAMBDA, CHOSEN_TAU = 0.1, 0.005
 
     from curl_cffi.requests import Session
     scraper_session = Session(impersonate="chrome")
@@ -260,8 +268,8 @@ if __name__ == "__main__":
     LRCX FIS APD PH SNPS ZTS TT WELL KLAC ITW
     VRTX FTNT FDX COF LRCX HCA NVR CTAS APD AJG
     TT AON BMY TRV FICO EMR PGR MCO NOC GD
-    FCX MET MET NSC CEG GWW RMD NXPI TFC ORLY
-    SRE SPLK MCK CME FSLR STLD WM MAR AMP MPC
+    FCX MET NSC CEG GWW RMD NXPI TFC ORLY
+    SRE CME FSLR STLD WM MAR AMP MPC
     GILD GIS LHX JCI NUE ADSK ADM WBD FICO AEE
     EOG PCG MSI COF CNC STT DXCM PSX CPS SNPS
     PAYX TRGP PH SRE SYY DFS HLT PPW KMI KDP
@@ -271,7 +279,7 @@ if __name__ == "__main__":
     O PAYC SO ODFL DLR LNT ALGN DLTR SBAC WELL
     DLTR CEG AON EQR VMC IDXX KEYS A CMI DOW
     CTRA AWK DUK HIG EQT LUV DLR DG KSB OTIS
-    OKE STT EXPE WEC WTW GRMN TSCO AVB K KSS
+    OKE STT EXPE WEC WTW GRMN TSCO AVB K
     URI GPN HRL BLK SYY CHD BG KEY CTSH GL
     INVH EBAY HPQ DOV FTV TSN FDX CE RJF BRO
     WST SWKS CAH CDW KMX APA BBY EXR VLO CTAS
@@ -281,25 +289,25 @@ if __name__ == "__main__":
     POOL PODD MAS EVRG LKQ JBHT FRT DPZ CNP CPRT
     KMX AES AAP SWK MHK RE NWL SEE XRAY LUMN
     CZR GNRC NXP PENN FLS SLG VNT XRX PTC MRNA
-    BBWI FDS SBNY SEDG HBI LEG WU WTW MOH CPT
+    BBWI FDS SEDG HBI LEG WU WTW MOH CPT
     VICI KDP ON IPGP UA UAA ELV CSGP INVH EQT
-    PCG CTXS DRE TRGP ACGL GEN FSLR STLD GEHC
+    PCG TRGP ACGL GEN FSLR STLD GEHC
     BG PODD FICO LUMN AXON RVTY FI PANW EG KVUE
     COR ABNB BX LNC NWL VLTO DXC BLDR HUBB JBL
-    LULU UBER ALK ATVI OGN SEDG SEE DAY DOC DECK
-    SMCI WHR ZION CPAY FLT GEV SOLV VFC XRAY VST
-    PXD CRWD GDDY KKR CMA ILMN RHI SW WRK DELL
+    LULU UBER ALK OGN SEDG SEE DAY DOC DECK
+    SMCI WHR ZION CPAY GEV SOLV VFC XRAY VST
+    CRWD GDDY KKR CMA ILMN RHI SW DELL
     ERIE TPL MRO APO LII WDAY DASH EXE TKO WSM
-    BWA CE FMC COIN DDOG JNPR TTD ANSS XYZ HES
+    BWA CE FMC COIN DDOG JNPR TTD ANSS HES
     PSKY IBKR WBA APP EME HOOD SOLS Q EMN FISV
     """
     raw_tickers = list(set([t.strip() for t in sp500_string.split() if t.strip()]))
     
     print(f"Ingesting data target profiles for {len(raw_tickers)} equity tickers...")
-    df_bench_raw = yf.download("^GSPC", start="2018-01-01", end="2026-01-01", auto_adjust=True, progress=False, session=scraper_session)
+    df_bench_raw = yf.download("^GSPC", start="2015-01-01", end="2026-01-01", auto_adjust=True, progress=False, session=scraper_session)
     sp500_series = df_bench_raw['Close'].squeeze().ffill()
 
-    df_chunk_raw = yf.download(raw_tickers, start="2018-01-01", end="2026-01-01", auto_adjust=True, progress=False, session=scraper_session)
+    df_chunk_raw = yf.download(raw_tickers, start="2015-01-01", end="2026-01-01", auto_adjust=True, progress=False, session=scraper_session)
     df_stocks = df_chunk_raw['Close']
 
     common_idx = df_stocks.index.intersection(sp500_series.index)
