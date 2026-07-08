@@ -362,4 +362,5 @@ if __name__ == "__main__":
 
     plt.title("Fully Cleaned Mean-Variance & CVaR Strategy Backtest Engine", fontsize=12, fontweight="bold", pad=15)
     plt.tight_layout()
+    plt.savefig("SP500_backtest.png", dpi=300)
     plt.show()

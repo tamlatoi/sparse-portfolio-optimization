@@ -248,7 +248,7 @@ def run_hd_backtest(df_returns, benchmark_returns, lookback_window=252, rebalanc
 if __name__ == "__main__":
     START_DATE = "2016-01-01" 
     END_DATE = "2026-01-01"
-    CHOSEN_LAMBDA = 0.1  # Balanced perfectly now due to covariance matrix annualization fixes
+    CHOSEN_LAMBDA = 0.05  # Balanced perfectly now due to covariance matrix annualization fixes
     CHOSEN_TAU = 0.005    # Scaled down to realistically allow execution away from starting coordinates
 
     ticker_string = '''
@@ -339,6 +339,6 @@ if __name__ == "__main__":
     ax2.tick_params(axis='y', labelcolor="darkgreen")
 
     plt.tight_layout()
-    plt.savefig("hd_portfolio_performance_summary.png", dpi=300)
-    print("Simulation complete. Performance visualization saved to hd_portfolio_performance_summary.png")
+    plt.savefig("ETF_backtest.png", dpi=300)
+    print("Simulation complete. Performance visualization saved to ETF_backtest.png")
     plt.show()

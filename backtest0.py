@@ -105,7 +105,6 @@ def run_comprehensive_backtest(
         strat_baseline_returns.append(ret_baseline)
         backtest_dates.append(current_date)
 
-        # Track assets that hold greater than a 0.1% meaningful position
         active_turnover_count.append(np.sum(weights_turnover > 0.001))
         active_baseline_count.append(np.sum(weights_baseline > 0.001))
 
@@ -181,7 +180,7 @@ def plot_comparative_results(results_df):
     ax2 = ax1.twinx()
     ax2.fill_between(results_df.index, results_df["Active_Assets_Turnover"], step="pre", color="#2ca02c", alpha=0.06, label="Turnover Asset Count", zorder=1)
 
-    ax2.set_ylabel("Number of Active Tickers Held (>0.1%)", fontsize=11, fontweight="bold", color="#2ca02c")
+    ax2.set_ylabel("Number of Tickers Held", fontsize=11, fontweight="bold", color="#2ca02c")
     ax2.tick_params(axis="y", labelcolor="#2ca02c")
     ax2.set_ylim(0, max(results_df["Active_Assets_Turnover"]) + 5)
 
@@ -194,6 +193,7 @@ def plot_comparative_results(results_df):
 
     plt.title("Markowitz Backtest Comparison (Initial Deployment from Zero)", fontsize=13, fontweight="bold", pad=15)
     fig.tight_layout()
+    plt.savefig("SP100_backtest.png", dpi=300)
     plt.show()
 
 
@@ -239,7 +239,7 @@ if __name__ == "__main__":
 
     # Parameters
     lambda_val = 0.1  # Risk-aversion index
-    tau_val = 0.005
+    tau_val = 0.05
 
     print("Running out-of-sample parallel historical simulation loop...\n")
     results = run_comprehensive_backtest(
