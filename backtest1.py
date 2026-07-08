@@ -320,12 +320,12 @@ if __name__ == "__main__":
 
     # Visualization Generation Pipeline
     fig, ax1 = plt.subplots(figsize=(14, 7))
-    ax1.plot(res.index, (1 + res["Strategy_Robust"]).cumprod() - 1, label="Strategy 1: Robust Turnover Constrained", color="#1f77b4", linewidth=2.5)
-    ax1.plot(res.index, (1 + res["Strategy_Markowitz"]).cumprod() - 1, label="Strategy 2: True Classic Markowitz Baseline", color="#d62728", linestyle=":", linewidth=2.2)
-    ax1.plot(res.index, (1 + res["Strategy_EqualWeight"]).cumprod() - 1, label="Strategy 3: Equal-Weighted 1/N Portfolio", color="grey", linestyle="-.", alpha=0.7)
-    ax1.plot(res.index, (1 + res["Benchmark_SPY"]).cumprod() - 1, label="Strategy 4: S&P 500 Index Benchmark (SPY)", color="black", linestyle="--", linewidth=1.5)
+    ax1.plot(res.index, ((1 + res["Strategy_Robust"]).cumprod() - 1)*100, label="Strategy 1: Robust Turnover Constrained", color="#1f77b4", linewidth=2.5)
+    ax1.plot(res.index, ((1 + res["Strategy_Markowitz"]).cumprod() - 1)*100, label="Strategy 2: True Classic Markowitz Baseline", color="#d62728", linestyle=":", linewidth=2.2)
+    ax1.plot(res.index, ((1 + res["Strategy_EqualWeight"]).cumprod() - 1)*100, label="Strategy 3: Equal-Weighted 1/N Portfolio", color="grey", linestyle="-.", alpha=0.7)
+    ax1.plot(res.index, ((1 + res["Benchmark_SPY"]).cumprod() - 1)*100, label="Strategy 4: S&P 500 Index Benchmark (SPY)", color="black", linestyle="--", linewidth=1.5)
     
-    ax1.set_title(f"High-Dimensional Portfolio Optimization Timeline (100 ETFs Matrix | Lambda={CHOSEN_LAMBDA}, Tau={CHOSEN_TAU})", fontsize=12, fontweight="bold")
+    ax1.set_title(f"High-Dimensional Portfolio Optimization Timeline", fontsize=12, fontweight="bold")
     ax1.set_xlabel("Historical Timeline", fontsize=11, fontweight="bold")
     ax1.set_ylabel("Cumulative Growth Return (%)", fontsize=11, fontweight="bold")
     ax1.grid(True, linestyle=":", alpha=0.6)
