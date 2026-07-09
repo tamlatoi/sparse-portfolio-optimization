@@ -178,10 +178,11 @@ def plot_comparative_results(results_df):
     ax1.grid(True, linestyle=":", alpha=0.5, zorder=0)
 
     ax2 = ax1.twinx()
-    ax2.fill_between(results_df.index, results_df["Active_Assets_Turnover"], step="pre", color="#2ca02c", alpha=0.06, label="Turnover Asset Count", zorder=1)
+    ax2.fill_between(results_df.index, results_df["Active_Assets_Turnover"], color="#317abf", alpha=0.15, linestyle="-", zorder = 1)
+    ax2.fill_between(results_df.index, results_df["Active_Assets_Baseline"], color="#dc1919", alpha=0.15, linestyle="-", zorder = 1)
 
-    ax2.set_ylabel("Number of Tickers Held", fontsize=11, fontweight="bold", color="#2ca02c")
-    ax2.tick_params(axis="y", labelcolor="#2ca02c")
+    ax2.set_ylabel("Number of Tickers Held", fontsize=11, fontweight="bold")
+    ax2.tick_params(axis="y")
     ax2.set_ylim(0, max(results_df["Active_Assets_Turnover"]) + 5)
 
     ax1.set_zorder(ax2.get_zorder() + 1)
@@ -191,7 +192,7 @@ def plot_comparative_results(results_df):
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", framealpha=0.9)
 
-    plt.title("Markowitz Backtest Comparison (Initial Deployment from Zero)", fontsize=13, fontweight="bold", pad=15)
+    plt.title("S&P 100 Backtest Results", fontsize=13, fontweight="bold", pad=15)
     fig.tight_layout()
     plt.savefig("SP100_backtest.png", dpi=300)
     plt.show()

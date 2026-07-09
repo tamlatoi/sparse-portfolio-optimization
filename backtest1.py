@@ -227,8 +227,8 @@ def run_hd_backtest(df_returns, benchmark_returns, lookback_window=252, rebalanc
         strat_spy_returns.append(benchmark_returns.loc[current_date])
         
         backtest_dates.append(current_date)
-        active_robust_counts.append(np.sum(w_robust > 0.005))
-        active_markowitz_counts.append(np.sum(w_markowitz > 0.005))
+        active_robust_counts.append(np.sum(w_robust > 0.001))
+        active_markowitz_counts.append(np.sum(w_markowitz > 0.001))
 
     res_df = pd.DataFrame({
         "Strategy_Robust": strat_robust_returns,
@@ -320,23 +320,23 @@ if __name__ == "__main__":
 
     # Visualization Generation Pipeline
     fig, ax1 = plt.subplots(figsize=(14, 7))
-    ax1.plot(res.index, ((1 + res["Strategy_Robust"]).cumprod() - 1)*100, label="Strategy 1: Robust Turnover Constrained", color="#1f77b4", linewidth=2.5)
-    ax1.plot(res.index, ((1 + res["Strategy_Markowitz"]).cumprod() - 1)*100, label="Strategy 2: True Classic Markowitz Baseline", color="#d62728", linestyle=":", linewidth=2.2)
-    ax1.plot(res.index, ((1 + res["Strategy_EqualWeight"]).cumprod() - 1)*100, label="Strategy 3: Equal-Weighted 1/N Portfolio", color="grey", linestyle="-.", alpha=0.7)
-    ax1.plot(res.index, ((1 + res["Benchmark_SPY"]).cumprod() - 1)*100, label="Strategy 4: S&P 500 Index Benchmark (SPY)", color="black", linestyle="--", linewidth=1.5)
-    
-    ax1.set_title(f"High-Dimensional Portfolio Optimization Timeline", fontsize=12, fontweight="bold")
-    ax1.set_xlabel("Historical Timeline", fontsize=11, fontweight="bold")
-    ax1.set_ylabel("Cumulative Growth Return (%)", fontsize=11, fontweight="bold")
+    ax1.plot(res.index, ((1 + res["Strategy_Robust"]).cumprod() - 1)*100, label="My Strategy", color="#1f77b4", linewidth=2.5)
+    ax1.plot(res.index, ((1 + res["Strategy_Markowitz"]).cumprod() - 1)*100, label="Markowitz Baseline", color="#d62728", linestyle=":", linewidth=2.2)
+    ax1.plot(res.index, ((1 + res["Strategy_EqualWeight"]).cumprod() - 1)*100, label="Equally Weighted Benchmark", color="grey", linestyle="-.", alpha=0.7)
+    ax1.plot(res.index, ((1 + res["Benchmark_SPY"]).cumprod() - 1)*100, label="S&P 500 Benchmark", color="black", linestyle="--", linewidth=1.5)
+
+    ax1.set_title(f"ETFs and Commodities Backtest Results", fontsize=12, fontweight="bold")
+    ax1.set_xlabel("Date", fontsize=11, fontweight="bold")
+    ax1.set_ylabel("Cumulative Return (%)", fontsize=11, fontweight="bold")
     ax1.grid(True, linestyle=":", alpha=0.6)
     ax1.legend(loc="upper left")
 
     # Secondary Asset Sparsity Overlay
     ax2 = ax1.twinx()
-    ax2.plot(res.index, res["Active_Assets_Robust"], color="#1f77b4", alpha=0.15, linestyle="-")
-    ax2.plot(res.index, res["Active_Assets_Markowitz"], color="#d62728", alpha=0.15, linestyle="--")
-    ax2.set_ylabel("Number of Underlying Active Assets Selected", color="darkgreen", fontsize=11, fontweight="bold")
-    ax2.tick_params(axis='y', labelcolor="darkgreen")
+    ax2.fill_between(res.index, res["Active_Assets_Robust"], color="#1f77b4", alpha=0.15, linestyle="-")
+    ax2.fill_between(res.index, res["Active_Assets_Markowitz"], color="#d62728", alpha=0.15, linestyle="-")
+    ax2.set_ylabel("Number of Tickers Held", fontsize=11, fontweight="bold")
+    ax2.tick_params(axis='y')
 
     plt.tight_layout()
     plt.savefig("ETF_backtest.png", dpi=300)
