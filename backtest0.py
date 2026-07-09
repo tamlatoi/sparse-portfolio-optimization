@@ -136,8 +136,8 @@ def evaluate_metrics(results_df, df_returns):
     results_df["Benchmark"] = benchmark_returns
 
     strategies = {
-        "Turnover Constrained Markowitz": "Strategy_Turnover",
-        "Pure Markowitz (Baseline)": "Strategy_Baseline",
+        "My Strategy": "Strategy_Turnover",
+        "Markowitz Baseline": "Strategy_Baseline",
         "Equally Weighted S&P 100 Index": "Benchmark",
     }
 
@@ -169,8 +169,8 @@ def plot_comparative_results(results_df):
     cum_baseline = (1 + results_df["Strategy_Baseline"]).cumprod() - 1
     cum_benchmark = (1 + results_df["Benchmark"]).cumprod() - 1
 
-    ax1.plot(cum_turnover.index, cum_turnover * 100, label="Turnover Constrained Markowitz", color="#1f77b4", linewidth=2.5, zorder=5)
-    ax1.plot(cum_baseline.index, cum_baseline * 100, label="Pure Markowitz Baseline", color="#d62728", linestyle="-.", linewidth=1.5, zorder=4)
+    ax1.plot(cum_turnover.index, cum_turnover * 100, label="My Strategy", color="#1f77b4", linewidth=2.5, zorder=5)
+    ax1.plot(cum_baseline.index, cum_baseline * 100, label="Markowitz Baseline", color="#d62728", linestyle="-.", linewidth=1.5, zorder=4)
     ax1.plot(cum_benchmark.index, cum_benchmark * 100, label="Equally Weighted Benchmark", color="#ff7f0e", linestyle="--", linewidth=1.5, zorder=3)
 
     ax1.set_xlabel("Date", fontsize=11, fontweight="bold")
