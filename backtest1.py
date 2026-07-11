@@ -246,46 +246,56 @@ def run_hd_backtest(df_returns, benchmark_returns, lookback_window=252, rebalanc
 # ==============================================================================
 
 if __name__ == "__main__":
-    START_DATE = "2016-01-01" 
+    START_DATE = "2015-01-01" 
     END_DATE = "2026-01-01"
-    CHOSEN_LAMBDA = 0.05  # Balanced perfectly now due to covariance matrix annualization fixes
-    CHOSEN_TAU = 0.005    # Scaled down to realistically allow execution away from starting coordinates
+    CHOSEN_LAMBDA = 0.05  
+    CHOSEN_TAU = 0.005    
 
+    # 1. The Asset Universe (Algorithm Can Invest In This)
     ticker_string = '''
-        SPY QQQ DIA IWM VTI VO IVV IJH IJR
-        MGK VUG SCHG IWF QTEC ONEQ SCHA VBK IWO
-        XLK XLY XLV XLF XLI XLC SMH XBI ITA
-        IGV SKYY CLOU CIBR HACK HERO GAMR IPAY FINX
-        BOTZ ROBO ARKK ARKW ARKG ARKF MOO PBW TAN
-        FAN LIT COPX GDX GDXJ REM VNQ IYR KRE
-        QQQE RSP SPLV USMV QUAL MTUM VIG NOBL SDY
-        EFA EEM VGK EWJ FXI MCHI ASHR INDA EPI PIN
-        EWC EWA EWG EWQ EWT EWY EWW TUR THD DXJ
-        BRK-B MSFT AAPL NVDA GOOGL AMZN META AVGO LLY V
+        SPY QQQ DIA IWM VTI VO IVV IJH IJR 
+        MGK VUG SCHG IWF QTEC ONEQ SCHA VBK IWO 
+        XLK XLY XLV XLF XLI XLC SMH XBI ITA 
+        IGV SKYY CLOU CIBR HACK HERO GAMR IPAY FINX 
+        BOTZ ROBO ARKK ARKW ARKG ARKF MOO PBW TAN 
+        FAN LIT COPX GDX GDXJ REM VNQ IYR KRE 
+        QQQE RSP SPLV USMV QUAL MTUM VIG NOBL SDY 
+        EFA EEM VGK EWJ FXI MCHI ASHR INDA EPI
+        EWC EWA EWG EWQ EWT EWY EWW TUR THD DXJ 
+        BRK-B MSFT AAPL NVDA GOOGL AMZN META AVGO LLY V 
         FAN LIT COPX GDX GDXJ GLD SLV REM VNQ IYR
     '''
 
     etfs_100 = list(sorted(list(set(ticker_string.split()))))
-    print(f"Loaded sandbox matrix with {len(etfs_100)} multi-asset components.")
+    print(f"Loaded sandbox matrix with {len(etfs_100)} unique multi-asset components for the algorithm.")
     
     scraper_session = Session(impersonate="chrome")
     
-    print("Downloading 100 ETF Data Matrix from Yahoo Finance...")
-    df_raw = yf.download(etfs_100, start=START_DATE, end=END_DATE, auto_adjust=True, session=scraper_session)
-    df_close = df_raw['Close'] if 'Close' in df_raw.columns else df_raw.xs('Close', axis=1, level=0)
+    # 2. Download Assets AND the Isolated Benchmark Index (^GSPC) together
+    download_list = etfs_100 + ["^GSPC"]
+    print("Downloading ETF Data Matrix and Isolated Benchmark from Yahoo Finance...")
+    df_raw = yf.download(download_list, start=START_DATE, end=END_DATE, auto_adjust=True, session=scraper_session)
+    df_close_all = df_raw['Close'] if 'Close' in df_raw.columns else df_raw.xs('Close', axis=1, level=0)
     
-    initial_cols = df_close.shape[1]
-    df_close = df_close.ffill().bfill()
-    df_close = df_close.dropna(axis=1, how='all')
-    final_cols = df_close.shape[1]
+    # Forward-fill / Backward-fill globally first to align trading calendars perfectly
+    df_close_all = df_close_all.ffill().bfill()
     
-    print(f"Data Matrix parsed. {final_cols} out of {initial_cols} assets retained successfully.")
+    # 3. Clean Split: Isolate the Benchmark from the Optimization Matrix
+    if "^GSPC" not in df_close_all.columns:
+        raise KeyError("Data Integrity Loss: '^GSPC' benchmark column missing.")
+        
+    # Extract the isolated S&P 500 index baseline
+    spy_benchmark = df_close_all["^GSPC"].pct_change().dropna()
     
-    if "SPY" not in df_close.columns:
-        raise KeyError("Data Integrity Loss: 'SPY' benchmark column was dropped from the metrics matrix.")
-
-    df_returns = df_close.pct_change().dropna()
-    spy_benchmark = df_returns["SPY"].copy()
+    # Extract the algorithm's asset universe (explicitly excluding the benchmark tracking ticker)
+    df_assets_close = df_close_all[etfs_100].copy()
+    df_assets_close = df_assets_close.dropna(axis=1, how='all') # Drop assets completely dead over the span
+    df_returns = df_assets_close.pct_change().dropna()
+    
+    # 4. Synchronize index dates to prevent compounding mismatch drift
+    common_dates = df_returns.index.intersection(spy_benchmark.index)
+    df_returns = df_returns.loc[common_dates]
+    spy_benchmark = spy_benchmark.loc[common_dates]
 
     print("\nRunning High-Dimensional Multi-Asset Optimizations...")
     res = run_hd_backtest(df_returns, spy_benchmark, lamb=CHOSEN_LAMBDA, tau=CHOSEN_TAU)
@@ -318,27 +328,23 @@ if __name__ == "__main__":
     print(pd.DataFrame(metrics).round(2).to_string())
     print("="*85 + "\n")
 
-    # Visualization Generation Pipeline
+    # Visualization
     fig, ax1 = plt.subplots(figsize=(14, 7))
     ax1.plot(res.index, ((1 + res["Strategy_Robust"]).cumprod() - 1)*100, label="My Strategy", color="#1f77b4", linewidth=2.5)
     ax1.plot(res.index, ((1 + res["Strategy_Markowitz"]).cumprod() - 1)*100, label="Markowitz Baseline", color="#d62728", linestyle=":", linewidth=2.2)
     ax1.plot(res.index, ((1 + res["Strategy_EqualWeight"]).cumprod() - 1)*100, label="Equally Weighted Benchmark", color="grey", linestyle="-.", alpha=0.7)
     ax1.plot(res.index, ((1 + res["Benchmark_SPY"]).cumprod() - 1)*100, label="S&P 500 Benchmark", color="black", linestyle="--", linewidth=1.5)
 
-    ax1.set_title(f"ETFs and Commodities Backtest Results", fontsize=12, fontweight="bold")
+    ax1.set_title("ETFs and Commodities Backtest Results", fontsize=12, fontweight="bold")
     ax1.set_xlabel("Date", fontsize=11, fontweight="bold")
     ax1.set_ylabel("Cumulative Return (%)", fontsize=11, fontweight="bold")
     ax1.grid(True, linestyle=":", alpha=0.6)
     ax1.legend(loc="upper left")
 
-    # Secondary Asset Sparsity Overlay
     ax2 = ax1.twinx()
     ax2.fill_between(res.index, res["Active_Assets_Robust"], color="#1f77b4", alpha=0.15, linestyle="-")
     ax2.fill_between(res.index, res["Active_Assets_Markowitz"], color="#d62728", alpha=0.15, linestyle="-")
     ax2.set_ylabel("Number of Tickers Held", fontsize=11, fontweight="bold")
-    ax2.tick_params(axis='y')
 
     plt.tight_layout()
-    plt.savefig("ETF_backtest.png", dpi=300)
-    print("Simulation complete. Performance visualization saved to ETF_backtest.png")
     plt.show()
